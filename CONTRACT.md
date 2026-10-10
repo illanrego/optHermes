@@ -48,19 +48,24 @@ class Log:
     def get(self, i: int) -> Record | None
     def range(self, lo: int, hi: int) -> list[Record]   # inclusive
     def count(self) -> int
-    # one writer, process-lifetime lock; torn lines skipped at load
+    # one writer, process-lifetime lock; a torn TAIL line is skipped at load
 
 # tree.py
 Line = dataclass(l: int, i: int, text: str, size: int)
 class Tree:
-    def put(self, l: int, i: int, text: str) -> None    # build once
+    def put(self, l: int, i: int, text: str) -> None    # build once; raises if built or children missing
     def get(self, l: int, i: int) -> Line | None
-    def buildable(self) -> list[tuple[int, int]]        # ready nodes, queue order
-    def needs_summary(self, l: int, i: int) -> bool     # size > NODE_BYTES
+    def children(self, l: int, i: int) -> tuple[tuple[int, int], tuple[int, int]]
+    def free_text(self, l: int, i: int) -> str | None   # text needing NO model call, else None
+    def buildable(self, count: int | None = None) -> list[tuple[int, int]]  # ready nodes; with count, only those covering <= count messages
+    def needs_summary(self, l: int, i: int) -> bool     # unbuilt and free_text is None
+    def save(self) -> None
+    def load(self) -> None
 
 # view.py
-def due(l: int, i: int, T: int) -> float                # (T - last) / 2**l
+def due(l: int, i: int, T: int) -> float                # (T - last) / 2**l, last = (i+2)*2**l - 1
 class View:
+    def add_root(self, i: int) -> None
     def merge_batch(self, T: int) -> None               # down to VIEW_MIN_BYTES
     def lines(self) -> list[Line]
     def render(self) -> str                             # "<chat>...</chat>"
@@ -68,11 +73,25 @@ class View:
     def load(self) -> None
 
 # compactor.py
+Summarizer = Callable[[str], str]                       # injected: prompt -> one line
+
 class Compactor:
+    def __init__(self, tree: Tree, summarize: Summarizer, *,
+                 node_bytes: int = NODE_BYTES, max_retries: int = COMPACT_MAX_RETRIES)
+    def seed(self, i: int, text: str) -> None           # register message i as node(0, i)
     def submit(self, l: int, i: int) -> None
-    def run_pending(self, limit: int = COMPACT_CONCURRENCY) -> int
-    def summarize(self, l: int, i: int) -> str          # ruler, retry<=5, keep shortest
+    def run_pending(self, limit: int = COMPACT_CONCURRENCY) -> int   # nodes built; sequential in v1
 ```
+
+**Load strictness (store).** A torn *tail* line is skipped and costs nothing. A gap in
+the record ids is a different thing: `Log` raises `ValueError` rather than silently
+re-indexing, because ids are the identity every other module keys on. Mid-file
+corruption should be loud.
+
+**`seed` is the only way roots appear.** `Tree` starts empty; `Compactor.seed(i, text)`
+registers message `i`, putting it as `node(0, i)` when it fits in `NODE_BYTES` (free, no
+model call) and leaving it unbuilt when it does not (the model compresses it). Nothing
+else creates level-0 nodes.
 
 ### `select_context` (the crux)
 
