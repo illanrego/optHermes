@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import heapq
+import time
 import warnings
 from collections.abc import Callable
 from dataclasses import dataclass, replace
@@ -113,12 +114,42 @@ class Compactor:
                 actual_bytes=length, node_bytes=self.node_bytes, cut_point=prefix)
         return shortest
 
-    def run_pending(self, limit: int = 8) -> int:
+    def settle(self, max_nodes: int = 64, timeout_s: float = 20.0, *,
+               model_calls: bool = False) -> int:
+        """Build pending nodes until the view settles or admission is bounded.
+
+        ``model_calls`` defaults to False: the turn path calls this synchronously, and a
+        summarizer call already in flight cannot be interrupted by the deadline, so a turn
+        must never start one. Model work is left to the background ``run_pending``.
+        """
+        built = 0
+        try:
+            deadline = time.monotonic() + timeout_s
+            while built < max_nodes and time.monotonic() < deadline:
+                if self.view is not None and self.view.settled():
+                    break
+                progress = self.run_pending(limit=1, deadline=deadline, model_calls=model_calls)
+                if progress == 0:
+                    break
+                built += progress
+        except Exception as exc:
+            warnings.warn(f"Settle failed: {exc}", RuntimeWarning, stacklevel=2)
+        return built
+
+    def run_pending(self, limit: int = 8, *, deadline: float | None = None,
+                    model_calls: bool = True) -> int:
+        """Build pending nodes.
+
+        ``model_calls=False`` builds only nodes that need no model (``free_text``) and
+        defers the rest. A synchronous caller must use it: the deadline is checked between
+        nodes and cannot interrupt a summarizer call already in flight.
+        """
         if limit < 0:
             raise ValueError("limit must be nonnegative")
         built = 0
         deferred: list[tuple[int, int]] = []
-        while self._pending and built < limit:
+        while (self._pending and built < limit
+               and (deadline is None or time.monotonic() < deadline)):
             l, i = heapq.heappop(self._pending)
             self._queued.remove((l, i))
             if self.tree.get(l, i) is not None:
@@ -127,6 +158,9 @@ class Compactor:
                 deferred.append((l, i))
                 continue
             free = self.tree.free_text(l, i)
+            if free is None and not model_calls:
+                deferred.append((l, i))
+                continue
             if free is None:
                 request = self._request(l, i)
                 if request is None:

@@ -2,9 +2,11 @@
 
 import copy
 import json
+import logging
 
 from optchat import OptChatEngine
 from optchat.prompts import SYSTEM_PROMPT
+from optchat.tree import Tree
 
 
 class FakeSummarizer:
@@ -94,6 +96,55 @@ def test_large_message_uses_summarizer_and_raw_message_survives(tmp_path):
     assert engine.log.get(0).text == text
     assert engine.tree.get(0, 0).text == "summary"
     assert len(summarizer.prompts) == 1
+
+
+def _short_chat(n):
+    return [{"role": "user", "content": f"m{i}"} for i in range(n)]
+
+
+def test_selection_never_starts_a_model_call(tmp_path):
+    """select_context runs synchronously inside the host's request, and a summarizer call
+    in flight cannot be interrupted by the deadline. So it must not start one: anything
+    needing a model is left to the background, and the view may hold a placeholder."""
+    summarizer = FakeSummarizer()
+    engine = OptChatEngine(tmp_path, node_bytes=32, summarize=summarizer)
+    engine.on_turn_complete([{"role": "user", "content": "x" * 80} for _ in range(9)])
+    before = len(summarizer.prompts)
+    assert not engine.view.settled()
+
+    selected = engine.select_context([{"role": "user", "content": "next"}])
+
+    assert len(summarizer.prompts) == before
+    assert "(not summarized yet: zoom it)" in selected[1]["content"]
+
+
+def test_end_of_turn_compaction_settles_the_view(tmp_path):
+    """v1's admission is delivered by the end-of-turn background pass, not by the inline
+    settle: after on_turn_complete the view has no placeholder, so the next turn starts
+    settled. The pass is bounded at 8 model nodes per turn."""
+    summarizer = FakeSummarizer()
+    engine = OptChatEngine(tmp_path, node_bytes=32, summarize=summarizer)
+    engine.on_turn_complete([{"role": "user", "content": "x" * 80}])
+
+    assert engine.tree.get(0, 0).text == "summary"
+    assert engine.view.settled()
+    assert len(summarizer.prompts) == 1
+
+
+def test_selection_serves_current_view_when_settle_raises(tmp_path, monkeypatch, caplog):
+    engine = OptChatEngine(tmp_path, summarize=FakeSummarizer())
+    engine.on_turn_complete([{"role": "user", "content": "first"}])
+    current_view = engine.view.render()
+
+    def fail_settle(**_kwargs):
+        raise RuntimeError("admission failed")
+
+    monkeypatch.setattr(engine.compactor, "settle", fail_settle)
+    with caplog.at_level(logging.ERROR, logger="optchat.engine"):
+        selected = engine.select_context([{"role": "user", "content": "next"}])
+
+    assert selected[1]["content"] == current_view
+    assert "admission failed" in caplog.text
 
 
 def test_withheld_transcript_can_be_recovered_from_view_and_zoom(tmp_path):

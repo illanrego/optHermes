@@ -105,6 +105,19 @@ def test_render_and_persistence_never_rebuild_existing_view(tmp_path):
     assert "date" not in loaded.render()
 
 
+def test_settled_tracks_placeholder_lines(tmp_path):
+    tree = Tree(tmp_path)
+    view = View(tree)
+    assert view.settled()
+    view.add_root(0)
+    view.add_root(1)
+    assert not view.settled()
+    tree.put(0, 0, "first")
+    assert not view.settled()
+    tree.put(0, 1, "second")
+    assert view.settled()
+
+
 def test_missing_view_is_created_once_from_tree(tmp_path):
     tree = Tree(tmp_path)
     tree.put(0, 0, "a")

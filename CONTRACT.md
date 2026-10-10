@@ -235,12 +235,22 @@ Summarizer = Callable[[CompactionRequest], str]
 - `make_host_summarizer` sends them through the aux route: the system as a system
   message, the context and task as the user message, and `tools` passed through.
 
-## Admission (settle)
+## Admission (settle) - as built, and its honest limit
 
-Before a turn is served, every message before the current one must be summarized.
-`select_context` runs a bounded settle - `Compactor.settle(max_nodes, timeout_s)` - and
-serves what it has when the bound is hit. Stock Hermes has no fail-closed sentinel, so the
-bound is the guard; the seam's `ContextSelectionBlocked` stays a later upgrade.
+A view is *settled* when no line is a placeholder, which is true as soon as every message
+has a node. A short message's node is free and is put at seed time; a long message's node
+needs a model.
+
+So the inline settle (`Compactor.settle`, `model_calls=False`) can only clear **free** work,
+and the turn path must never start a model call: `select_context` runs synchronously inside
+the host's request, and a summarizer call already in flight cannot be interrupted by the
+deadline. **v1's admission is therefore delivered by the end-of-turn background pass**
+(`on_turn_complete` -> `run_pending(limit=8)`), which leaves the next turn settled unless
+more than 8 nodes were pending. A turn can still see a placeholder for a long message the
+background has not reached - the honest gap.
+
+Stock Hermes has no fail-closed sentinel, so the seam's `ContextSelectionBlocked` remains
+the real upgrade: it would let the engine refuse a request rather than serve a stale view.
 
 ## Kinds
 

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 import os
 from pathlib import Path
 from typing import Any
@@ -33,6 +34,9 @@ from .store import Log
 from .tree import Tree
 from .view import View
 from . import tools as opt_tools
+
+
+logger = logging.getLogger(__name__)
 
 
 def default_root() -> Path:
@@ -137,12 +141,28 @@ class OptChatEngine(ContextEngine):
             if SYSTEM_PROMPT not in content:
                 system[0]["content"] = content + "\n\n" + SYSTEM_PROMPT
         turn = [copy.deepcopy(message) for message in request_messages[last_user:]]
-        _, _, view, compactor = self._open()
+        _, tree, view, compactor = self._open()
         self._turn_system = _content_text(system[0].get("content"))
         compactor.system = self._turn_system
         if not hasattr(ContextEngine, "cache_plan"):
             self._turn_tools = self.get_tool_schemas()
         compactor.tools = self._turn_tools
+        built = 0
+        try:
+            max_nodes, timeout_s = 64, 20.0
+            config_path = self.root / "config.json"
+            if config_path.is_file():
+                config = json.loads(config_path.read_text(encoding="utf-8"))
+                max_nodes = config.get("settle_max_nodes", max_nodes)
+                timeout_s = config.get("settle_timeout_s", timeout_s)
+            # model_calls stays False: this runs synchronously inside the host's request,
+            # and a summarizer call cannot be interrupted by the deadline. Anything that
+            # needs a model is built by the background run_pending after the turn.
+            built = compactor.settle(max_nodes=max_nodes, timeout_s=timeout_s)
+            tree.save()
+        except Exception:
+            logger.exception("OptChat settle failed; serving the current view")
+        logger.debug("OptChat settle built %d nodes; view settled: %s", built, view.settled())
         return system + [{"role": "assistant", "content": view.render()}] + turn
 
     def get_tool_schemas(self) -> list[dict[str, Any]]:

@@ -190,7 +190,10 @@ The **memory** half is faithful; the **navigation** half was thin. Findings and 
 - Compaction calls shaped like turns: the same system prompt and tools, plus a `<chat>`
   context view - so they read the turns' cache entry, and so the merge template's
   "`<chat>` may hold their messages in more detail" stops referring to nothing.
-- Admission: settle the view before serving a turn, so a turn cannot start on a placeholder.
+- Admission: delivered by the end-of-turn background pass, bounded at 8 model nodes per
+  turn. Honest limit: the inline settle can only clear free work, and the turn path must not
+  start a model call, so a turn can still see a placeholder for a long message the
+  background has not reached.
 - The `work` and `note` kinds.
 - Long text split into several messages, never cut.
 - Compaction concurrency: up to 8 calls at once.

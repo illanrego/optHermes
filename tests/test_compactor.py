@@ -1,3 +1,5 @@
+import time
+
 import pytest
 
 from optchat.compactor import Compactor
@@ -137,3 +139,112 @@ def test_retry_only_changes_task_and_failure_leaves_node_unbuilt(tmp_path):
     assert requests[1].context == requests[0].context
     assert "Too long:" not in requests[1].context
     assert "Too long:" in requests[1].task
+
+
+def test_settle_default_builds_only_free_nodes(tmp_path):
+    """The turn path calls settle synchronously, so by default it must never start a model
+    call: free nodes are built, anything needing a model is deferred to the background.
+
+    Note what this can and cannot do: a view is unsettled only when a *message* has no node,
+    and a short message's node is free at seed time - so the only work settle can do is a
+    free parent elsewhere in the tree.
+    """
+    tree = Tree(tmp_path, node_bytes=8)
+    view = View(tree)
+    calls = []
+
+    def summarize(_request):
+        calls.append(1)
+        return "short"
+
+    compactor = Compactor(tree, summarize, node_bytes=8, view=view)
+    compactor.seed(0, "long source")   # needs a model
+    view.add_root(0)
+    compactor.seed(1, "long source")   # needs a model
+    view.add_root(1)
+    compactor.seed(2, "a")             # free, and its pair with 3 is a free parent
+    view.add_root(2)
+    compactor.seed(3, "b")
+    view.add_root(3)
+
+    assert not view.settled()
+    assert compactor.settle() == 1
+    assert tree.get(1, 1).text == "a\nb"
+    assert tree.get(0, 0) is None      # the model nodes are deferred
+    assert calls == []                 # no model call was started
+    assert not view.settled()
+
+
+def test_settle_with_model_calls_settles_the_whole_view(tmp_path):
+    tree = Tree(tmp_path, node_bytes=8)
+    view = View(tree)
+    compactor = Compactor(tree, lambda _request: "short", node_bytes=8, view=view)
+    compactor.seed(0, "long source")
+    view.add_root(0)
+
+    assert compactor.settle(model_calls=True) == 1
+    assert view.settled()
+    assert tree.get(0, 0).text == "short"
+
+
+def test_settle_stops_at_max_nodes(tmp_path):
+    tree = Tree(tmp_path, node_bytes=8)
+    view = View(tree)
+    compactor = Compactor(tree, lambda _request: "short", node_bytes=8, view=view)
+    for i in range(3):
+        compactor.seed(i, "long source")
+        view.add_root(i)
+
+    assert compactor.settle(max_nodes=1, model_calls=True) == 1
+    assert not view.settled()
+    assert sum(tree.get(0, i) is not None for i in range(3)) == 1
+
+
+def test_settle_stops_after_deadline(tmp_path):
+    tree = Tree(tmp_path, node_bytes=8)
+    view = View(tree)
+    calls = []
+
+    def summarize(_request):
+        calls.append(1)
+        time.sleep(0.03)
+        return "short"
+
+    compactor = Compactor(tree, summarize, node_bytes=8, view=view)
+    for i in range(3):
+        compactor.seed(i, "long source")
+        view.add_root(i)
+
+    assert compactor.settle(timeout_s=0.005, model_calls=True) == 1
+    assert len(calls) == 1
+    assert not view.settled()
+
+
+def test_settle_does_not_retry_a_deferred_failure_in_one_call(tmp_path):
+    tree = Tree(tmp_path, node_bytes=8)
+    view = View(tree)
+    calls = []
+
+    def summarize(_request):
+        calls.append(1)
+        raise RuntimeError("offline")
+
+    compactor = Compactor(tree, summarize, node_bytes=8, view=view)
+    compactor.seed(0, "long source")
+    view.add_root(0)
+    with pytest.warns(RuntimeWarning, match="offline"):
+        assert compactor.settle(model_calls=True) == 0
+    assert calls == [1]
+    assert tree.get(0, 0) is None
+    assert not view.settled()
+
+
+def test_settle_stops_when_view_has_no_buildable_work(tmp_path):
+    tree = Tree(tmp_path)
+    view = View(tree)
+    view.add_root(0)
+    compactor = Compactor(tree, lambda _request: pytest.fail("unexpected model call"),
+                          view=view)
+
+    assert compactor.settle() == 0
+    assert not view.settled()

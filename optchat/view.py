@@ -41,6 +41,10 @@ class View:
     def lines(self) -> list[Line]:
         return self._lines(self._pairs)
 
+    def settled(self) -> bool:
+        """Return whether every live view line has a built summary."""
+        return all(line.text != PLACEHOLDER for line in self.lines())
+
     def _lines(self, pairs: list[tuple[int, int]]) -> list[Line]:
         result = []
         for l, i in pairs:
