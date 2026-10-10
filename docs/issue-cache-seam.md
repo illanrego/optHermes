@@ -59,8 +59,9 @@ able to opt in when the host's caching is off, or is that deliberately a separat
 
 ## Status
 
-I have an implementation of exactly this on a branch - 5 files, +147/-2, with tests
-covering the ABC default, a non-implementing engine staying byte-identical, an
-implementing engine's plan being used, and a raising hook failing open. Happy to open a
-PR if the direction is wanted; not opening it yet, per the issue-first guidance in
-CONTRIBUTING.md.
+I have an implementation of exactly this on a branch -
+https://github.com/illanrego/hermes-agent/tree/feat/context-engine-cache-seam - 5 files,
++147/-2, with tests covering the ABC default, a non-implementing engine staying
+byte-identical, an implementing engine's plan being used, and a raising hook failing
+open. Happy to open a PR if the direction is wanted; not opening it yet, per the
+issue-first guidance in CONTRIBUTING.md.
