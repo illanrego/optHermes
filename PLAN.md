@@ -174,7 +174,11 @@ turns into the chat.
 
 ## Audit vs the original gist (2026-10-10)
 
-The **memory** half is faithful; the **navigation** half was thin. Findings and their state:
+The **memory** half is faithful; the **navigation** half was thin. Everything found is now
+fixed except the two items that are features rather than fixes (per-subagent logs, media).
+Suite: 79 tests.
+
+Findings and their state:
 
 ### Was broken (fixed)
 
@@ -225,7 +229,30 @@ pair's last message (push-equivalence through 2000) · the 64-128 KB sawtooth ·
 view, never rebuilt · no dates in the view · the placeholder line · the ruler and the at
 most 5 attempts keeping the shortest · the rubric's priority order · the five behavioural
 lines · `zoom(id, n)` semantics · the cache discipline (16,000 of ~16,363 input tokens read
-from cache inside one session).
+from cache inside one session) · **autonomous zoom, observed**: with the tools reachable the
+model opened a folded 32-message line down to the messages itself, unprompted.
+
+### Host-side blocker: the engine's tools are gated behind a toolset flag
+
+`_inject_context_engine_tools` (`agent/agent_init.py`) injects an engine's
+`get_tool_schemas()` into `agent.tools` only when `agent.enabled_toolsets` contains
+`context_engine`. That list comes from `_get_platform_tools(cfg, "cli")`, which auto-adds
+`context_engine` when `_context_engine_active(config)` is true (i.e. `context.engine` is not
+`compressor`). In the one-shot path (`chat -q`) the entry does not survive resolution, so
+**the engine runs while its tools never reach the model**: `select_context` is honoured and
+the log/view are written, but `optchat_zoom` / `optchat_date` are invisible.
+
+Measured in `opthermes-dev`:
+
+- `hermes -p opthermes-dev chat -q "list tools containing optchat"` -> the model answers
+  `NONE`.
+- `hermes -p opthermes-dev -t context_engine chat -q "..."` -> the model has both tools, and
+  calls `optchat_zoom(0, 32)` then `optchat_zoom(16, 16)` on its own.
+
+Workaround: pass `-t context_engine`. The real fix is host-side - an active engine's tools
+should be injected because the engine is active, not because a toolset entry survived
+resolution. It is the same family as the cache seam (the engine needs first-class
+reachability) and belongs in the conversation around the PR.
 
 ## Open questions
 
