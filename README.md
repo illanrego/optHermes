@@ -12,7 +12,19 @@ OptChat's philosophy, through public seams.
   They are read-only reference for Hermes internals only. We implement the gist
   ourselves; no code is copied from either.
 
-**Status:** planning. Contract frozen, no code yet.
+**Status:** working. The engine runs live in an isolated profile; the upstream seam is
+open as PR #136135.
+
+## Known behaviour (measured, not assumed)
+
+- **The cache benefit requires a continuous session.** Inside one session, a turn's second
+  API call read 16,000 of ~16,363 input tokens from cache. Across separate sessions the
+  prefix never matches and cache reads are zero. One endless chat is the intended shape.
+- The engine replaces the **history**, not the host's system prompt or tool schemas
+  (~16k tokens before the view), so the saving scales with how much history the session
+  would otherwise carry.
+- Pin `auxiliary.optchat` to a cheap or low-effort model: one compaction on a reasoning
+  model burned 9,483 output tokens for a single 512-byte line.
 
 ## Layout
 
