@@ -88,6 +88,39 @@ def test_tool_mapping_and_json_errors(tmp_path):
     assert "error" in json.loads(engine.handle_tool_call("optchat_date", {"id": -1}))
 
 
+def test_delegate_result_is_work_and_other_tool_result_is_echo(tmp_path):
+    engine = OptChatEngine(tmp_path, summarize=FakeSummarizer())
+    calls = {"role": "assistant", "content": None, "tool_calls": [
+        {"id": "child-1", "function": {"name": "delegate_task", "arguments": "{}"}},
+        {"id": "lookup-1", "function": {"name": "lookup", "arguments": "{}"}},
+    ]}
+    messages = [calls,
+                {"role": "tool", "tool_call_id": "lookup-1", "content": "lookup result"},
+                {"role": "tool", "tool_call_id": "child-1",
+                 "content": '{"agent":"Researcher","report":"found it"}'}]
+    assert OptChatEngine._message_records(messages, 512)[-2:] == [
+        ("echo", "lookup result"),
+        ("work", '[Researcher] {"agent":"Researcher","report":"found it"}')]
+
+    engine.on_turn_complete(messages[:1])
+    engine.on_turn_complete(messages)
+    assert [(record.kind, record.text) for record in engine.log.range(2, 3)] == [
+        ("echo", "lookup result"),
+        ("work", '[Researcher] {"agent":"Researcher","report":"found it"}')]
+
+
+def test_delegate_result_name_fallback_and_field_priority():
+    messages = [{"role": "assistant", "tool_calls": [
+        {"id": "one", "function": {"name": "delegate_task"}},
+        {"id": "two", "function": {"name": "delegate_task"}},
+    ]},
+        {"role": "tool", "tool_call_id": "one", "content": '{"task":"Audit"}'},
+        {"role": "tool", "tool_call_id": "two", "content": "plain report"}]
+    assert OptChatEngine._message_records(messages, 512)[-2:] == [
+        ("work", '[Audit] {"task":"Audit"}'),
+        ("work", "[subagent] plain report")]
+
+
 def test_long_user_message_is_logged_as_consecutive_free_records(tmp_path):
     summarizer = FakeSummarizer()
     engine = OptChatEngine(tmp_path, node_bytes=32, summarize=summarizer)

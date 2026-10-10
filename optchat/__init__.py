@@ -4,6 +4,7 @@ import logging
 from pathlib import Path
 
 from .engine import OptChatEngine, default_root
+from .notes import import_notes
 
 logger = logging.getLogger(__name__)
 
@@ -41,4 +42,4 @@ def register(ctx) -> None:
     register_engine(engine)
 
 
-__all__ = ["OptChatEngine", "default_root", "register"]
+__all__ = ["OptChatEngine", "default_root", "import_notes", "register"]

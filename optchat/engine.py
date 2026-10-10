@@ -3,7 +3,8 @@
 Host messages map to log kinds as follows: system is host-owned and omitted;
 user becomes user; text-only assistant becomes unii; assistant with tool_calls
 becomes tool (name and JSON arguments, including any accompanying content);
-tool results become echo. Thinking fields are never logged.
+delegate_task results become work, and other tool results become echo.
+Thinking fields are never logged.
 
 The host ABC is imported here, rather than by the package entry point. When
 Hermes is absent, a local base permits standalone unit tests; an engine loaded
@@ -63,6 +64,24 @@ def _content_text(content: Any) -> str:
         return "\n".join(part.get("text", "") for part in content
                          if isinstance(part, dict) and isinstance(part.get("text"), str))
     return "" if content is None else str(content)
+
+
+def _delegate_name(text: str) -> str:
+    """Use a named JSON result when available, otherwise label the child generically.
+
+    Host delegate results have no fixed shape. Only nonempty string values in
+    name, agent, or task are useful labels; all other shapes use ``subagent``.
+    """
+    try:
+        result = json.loads(text)
+    except json.JSONDecodeError:
+        return "subagent"
+    if isinstance(result, dict):
+        for key in ("name", "agent", "task"):
+            value = result.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return "subagent"
 
 
 class OptChatEngine(ContextEngine):
@@ -190,15 +209,19 @@ class OptChatEngine(ContextEngine):
         return json.dumps({"error": f"Unknown context engine tool: {name}"})
 
     @staticmethod
-    def _records(message: dict[str, Any], node_bytes: int) -> list[tuple[str, str]]:
+    def _records(message: dict[str, Any], node_bytes: int,
+                 tool_name: str | None = None) -> list[tuple[str, str]]:
         role = message.get("role")
         if role == "user":
             return [("user", chunk) for chunk in split_text(
                 _content_text(message.get("content")), node_bytes)]
         if role == "tool":
             text = _content_text(message.get("content"))
+            name = _delegate_name(text) if tool_name == "delegate_task" else None
             if len(text) > 30_000:
                 text = text[:15_000] + text[-15_000:]
+            if name is not None:
+                return [("work", f"[{name}] {text}")]
             return [("echo", text)]
         if role == "assistant" and message.get("tool_calls"):
             records = []
@@ -222,6 +245,27 @@ class OptChatEngine(ContextEngine):
             return [("unii", chunk) for chunk in split_text(content, node_bytes)] if content else []
         return []
 
+    @staticmethod
+    def _message_records(messages: list[dict[str, Any]], node_bytes: int,
+                         start: int = 0) -> list[tuple[str, str]]:
+        """Classify rows using the call ids seen earlier in the transcript."""
+        tool_names: dict[str, str] = {}
+        records: list[tuple[str, str]] = []
+        for row, message in enumerate(messages):
+            if message.get("role") == "assistant":
+                for call in message.get("tool_calls") or []:
+                    if not isinstance(call, dict):
+                        continue
+                    function = call.get("function")
+                    if (isinstance(call.get("id"), str) and isinstance(function, dict)
+                            and isinstance(function.get("name"), str)):
+                        tool_names[call["id"]] = function["name"]
+            call_id = message.get("tool_call_id") if message.get("role") == "tool" else None
+            tool_name = tool_names.pop(call_id, None) if isinstance(call_id, str) else None
+            if row >= start:
+                records.extend(OptChatEngine._records(message, node_bytes, tool_name))
+        return records
+
     def on_turn_complete(self, messages: list[dict[str, Any]], usage: dict[str, Any] | None = None,
                          **kwargs: Any) -> None:
         # _open() first: an engine whose session never started learns its context there
@@ -233,12 +277,12 @@ class OptChatEngine(ContextEngine):
         # one assistant row can contain several tool calls or no visible text.
         if len(messages) < self._seen_messages:
             self._seen_messages = 0
-        for message in messages[self._seen_messages:]:
-            for kind, text in self._records(message, self.node_bytes):
-                index = log.append(kind, text)
-                compactor.seed(index, text)
-                view.add_root(index)
-            self._seen_messages += 1
+        for kind, text in self._message_records(messages, self.node_bytes,
+                                               start=self._seen_messages):
+            index = log.append(kind, text)
+            compactor.seed(index, text)
+            view.add_root(index)
+        self._seen_messages = len(messages)
         # One save per turn, not per record: the log append is already fsync'd per
         # record, and the tree and view are derived state.
         tree.save()
