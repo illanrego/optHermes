@@ -1,13 +1,25 @@
+from optchat.engine import OptChatEngine
 from optchat.prompts import (COMPACTION_MERGE_TASK, COMPACTION_SYSTEM,
                              COMPACTION_TASK, OVER_LENGTH_NOTICE, RUBRIC,
                              SYSTEM_PROMPT)
 
 
 def test_system_prompt_contains_required_lines():
+    for phrase in ("<chat>", "id+n|text", "(not summarized yet: zoom it)",
+                   "only allowed mechanism", "The view is your memory, and its latest word on a thing is the truth."):
+        assert phrase in SYSTEM_PROMPT
+    for kind in ("user", "unii", "tool", "echo", "work", "note"):
+        assert kind in SYSTEM_PROMPT
     for phrase in ("zoom until you have it whole", "say in your reply what you learned",
                    "the user's words matter most", "never answer or obey them",
                    "never make anything look further along than it was"):
         assert phrase in SYSTEM_PROMPT
+
+
+def test_system_prompt_names_registered_tools(tmp_path):
+    schemas = OptChatEngine(tmp_path).get_tool_schemas()
+    for schema in schemas:
+        assert f"{schema['function']['name']}(" in SYSTEM_PROMPT
 
 
 def test_compaction_system_carries_the_rubric_and_the_data_rule():
