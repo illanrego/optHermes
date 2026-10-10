@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -34,6 +35,18 @@ from .view import View
 from . import tools as opt_tools
 
 
+def default_root() -> Path:
+    """The chat directory for the active Hermes home.
+
+    The context-engine directory loader hands a plugin a minimal collector with no
+    plugin manager, so the home cannot be read from ``ctx``. The launcher exports
+    HERMES_HOME for the active profile, which is the same value, and reading it here
+    keeps the engine profile-scoped.
+    """
+    env = os.environ.get("HERMES_HOME")
+    return (Path(env) if env else Path.home() / ".hermes") / "optchat"
+
+
 def _missing_summarizer(_prompt: str) -> str:
     raise RuntimeError("No OptChat summarizer has been configured")
 
@@ -48,10 +61,10 @@ def _content_text(content: Any) -> str:
 
 
 class OptChatEngine(ContextEngine):
-    def __init__(self, root: Path, *, view_min_bytes: int = 64_000,
+    def __init__(self, root: Path | None = None, *, view_min_bytes: int = 64_000,
                  view_max_bytes: int = 128_000, node_bytes: int = 512,
                  summarize: Summarizer | None = None):
-        self.root = Path(root)
+        self.root = Path(root) if root is not None else default_root()
         self.view_min_bytes = view_min_bytes
         self.view_max_bytes = view_max_bytes
         self.node_bytes = node_bytes

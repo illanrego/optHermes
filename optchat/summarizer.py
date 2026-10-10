@@ -1,0 +1,51 @@
+"""Route OptChat compactions through Hermes' configured auxiliary task."""
+
+from __future__ import annotations
+
+import logging
+import math
+from collections.abc import Callable
+
+
+logger = logging.getLogger(__name__)
+
+
+def make_host_summarizer(*, timeout: float = 300.0) -> Callable[[str], str]:
+    """Return a prompt-to-line call using the host's ``auxiliary.optchat`` route.
+
+    Host imports stay inside this factory so standalone OptChat imports need no
+    Hermes installation. The host owns provider, model, credentials and retries.
+    """
+    if not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError("timeout must be a finite, positive number of seconds")
+
+    from agent.auxiliary_client import call_llm, extract_content_or_reasoning
+
+    try:
+        from agent.auxiliary_task_config import _get_auxiliary_task_config
+    except ImportError:
+        # Older hosts ship no task-config reader; call_llm(task=...) resolves the
+        # route itself, so the pre-check is simply skipped.
+        _get_auxiliary_task_config = None
+
+    def summarize(prompt: str) -> str:
+        if not isinstance(prompt, str):
+            raise TypeError("compaction prompt must be a string")
+        if _get_auxiliary_task_config is not None:
+            route = _get_auxiliary_task_config("optchat")
+            provider = route.get("provider") or "auto"
+            model = route.get("model") or ""
+            if provider != "auto" and not model:
+                raise RuntimeError("auxiliary.optchat pins a provider but no model")
+        logger.debug("OptChat compaction prompt: %d UTF-8 bytes", len(prompt.encode("utf-8")))
+        response = call_llm(
+            task="optchat",
+            messages=[{"role": "user", "content": prompt}],
+            timeout=float(timeout),
+        )
+        line = " ".join(extract_content_or_reasoning(response).splitlines()).strip()
+        if not line:
+            raise RuntimeError("OptChat auxiliary model returned an empty reply")
+        return line
+
+    return summarize
