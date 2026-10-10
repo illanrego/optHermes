@@ -7,6 +7,12 @@ from unittest.mock import patch
 
 import pytest
 
+from optchat.compactor import CompactionRequest
+
+
+def request(task="input", *, system="", context="", tools=None):
+    return CompactionRequest(system=system, context=context, task=task, tools=tools or [])
+
 
 def _fake_host(monkeypatch, call, *, provider="example", model="small"):
     agent = types.ModuleType("agent")
@@ -34,7 +40,7 @@ def test_import_does_not_import_host(monkeypatch):
         importlib.import_module("optchat.summarizer")
 
 
-def test_host_receives_exact_prompt_and_configured_task(monkeypatch):
+def test_host_receives_turn_system_context_task_tools_and_configured_route(monkeypatch):
     calls = []
 
     def call(**kwargs):
@@ -45,9 +51,23 @@ def test_host_receives_exact_prompt_and_configured_task(monkeypatch):
     from optchat.summarizer import make_host_summarizer
 
     prompt = "Compaction: café\n<input>\nwhole text\n</input>"
-    assert make_host_summarizer(timeout=17)(prompt) == "first second"
-    assert calls == [{"task": "optchat", "messages": [{"role": "user", "content": prompt}],
-                      "timeout": 17.0}]
+    tools = [{"type": "function", "function": {"name": "optchat_zoom"}}]
+    assert make_host_summarizer(timeout=17)(request(prompt, system="turn system",
+        context="<chat>\n0+1|prior\n</chat>", tools=tools)) == "first second"
+    assert calls == [{"task": "optchat", "messages": [
+        {"role": "system", "content": "turn system"},
+        {"role": "user", "content": "<chat>\n0+1|prior\n</chat>\n\n" + prompt}],
+        "tools": tools, "timeout": 17.0}]
+
+
+def test_empty_context_and_system_send_only_task(monkeypatch):
+    calls = []
+    _fake_host(monkeypatch, lambda **kwargs: calls.append(kwargs) or "line")
+    from optchat.summarizer import make_host_summarizer
+
+    assert make_host_summarizer()(request("task")) == "line"
+    assert calls[0]["messages"] == [{"role": "user", "content": "task"}]
+    assert calls[0]["tools"] is None
 
 
 def test_host_failure_propagates(monkeypatch):
@@ -58,7 +78,7 @@ def test_host_failure_propagates(monkeypatch):
     from optchat.summarizer import make_host_summarizer
 
     with pytest.raises(TimeoutError, match="model timed out"):
-        make_host_summarizer()("input")
+        make_host_summarizer()(request())
 
 
 def test_empty_reply_and_missing_route_fail_closed(monkeypatch):
@@ -66,10 +86,10 @@ def test_empty_reply_and_missing_route_fail_closed(monkeypatch):
     from optchat.summarizer import make_host_summarizer
 
     with pytest.raises(RuntimeError, match="empty reply"):
-        make_host_summarizer()("input")
+        make_host_summarizer()(request())
     _fake_host(monkeypatch, lambda **_kwargs: "unused", model="")
     with pytest.raises(RuntimeError, match="pins a provider but no model"):
-        make_host_summarizer()("input")
+        make_host_summarizer()(request())
 
 
 def test_auto_provider_inherits_the_main_model(monkeypatch):
@@ -83,7 +103,7 @@ def test_auto_provider_inherits_the_main_model(monkeypatch):
     _fake_host(monkeypatch, call, provider="auto", model="")
     from optchat.summarizer import make_host_summarizer
 
-    assert make_host_summarizer()("input") == "a line"
+    assert make_host_summarizer()(request()) == "a line"
     assert calls and calls[0]["task"] == "optchat"
 
 

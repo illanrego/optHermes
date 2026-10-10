@@ -39,8 +39,11 @@ class View:
         return (i + 1) << l
 
     def lines(self) -> list[Line]:
+        return self._lines(self._pairs)
+
+    def _lines(self, pairs: list[tuple[int, int]]) -> list[Line]:
         result = []
-        for l, i in self._pairs:
+        for l, i in pairs:
             line = self.tree.get(l, i)
             if line is None:
                 result.append(Line(l, i, PLACEHOLDER, len(PLACEHOLDER.encode("utf-8"))))
@@ -49,22 +52,36 @@ class View:
         return result
 
     def render(self) -> str:
-        body = [f"{line.i << line.l}+{1 << line.l}|{line.text.replace(chr(10), ' ').replace(chr(13), ' ')}" for line in self.lines()]
+        return self._render(self._pairs)
+
+    def _render(self, pairs: list[tuple[int, int]]) -> str:
+        body = [f"{line.i << line.l}+{1 << line.l}|{line.text.replace(chr(10), ' ').replace(chr(13), ' ')}" for line in self._lines(pairs)]
         return "<chat>\n" + "\n".join(body) + ("\n" if body else "") + "</chat>"
 
-    def _size(self) -> int:
-        return len(self.render().encode("utf-8"))
+    def _size(self, pairs: list[tuple[int, int]]) -> int:
+        return len(self._render(pairs).encode("utf-8"))
+
+    def context_view(self, min_bytes: int = 16_000, max_bytes: int = 32_000) -> str:
+        if min_bytes < 0 or max_bytes <= 0 or min_bytes > max_bytes:
+            raise ValueError("View budgets must satisfy 0 <= min_bytes <= max_bytes")
+        pairs = self._pairs.copy()
+        self._merge_pairs(pairs, self._end(), min_bytes, max_bytes)
+        return self._render(pairs)
 
     def merge_batch(self, T: int) -> None:
         if T != self._end():
             raise ValueError("Message count does not match view coverage")
-        if self._size() <= self.max_bytes:
+        self._merge_pairs(self._pairs, T, self.min_bytes, self.max_bytes)
+
+    def _merge_pairs(self, pairs: list[tuple[int, int]], T: int,
+                     min_bytes: int, max_bytes: int) -> None:
+        if self._size(pairs) <= max_bytes:
             return
-        while self._size() > self.min_bytes:
+        while self._size(pairs) > min_bytes:
             best: tuple[float, int, int] | None = None
-            for pos in range(len(self._pairs) - 1):
-                l, i = self._pairs[pos]
-                if i % 2 or self._pairs[pos + 1] != (l, i + 1):
+            for pos in range(len(pairs) - 1):
+                l, i = pairs[pos]
+                if i % 2 or pairs[pos + 1] != (l, i + 1):
                     continue
                 if self.tree.get(l + 1, i // 2) is None:
                     continue
@@ -74,8 +91,8 @@ class View:
             if best is None:
                 break
             pos = best[2]
-            l, i = self._pairs[pos]
-            self._pairs[pos:pos + 2] = [(l + 1, i // 2)]
+            l, i = pairs[pos]
+            pairs[pos:pos + 2] = [(l + 1, i // 2)]
 
     def save(self) -> None:
         path = Path(self.tree.root) / "view.json"

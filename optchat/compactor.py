@@ -5,24 +5,37 @@ from __future__ import annotations
 import heapq
 import warnings
 from collections.abc import Callable
+from dataclasses import dataclass, replace
 
 from .prompts import (COMPACTION_MERGE_TASK, COMPACTION_SYSTEM, COMPACTION_TASK,
                       OVER_LENGTH_NOTICE, RUBRIC)
 from .tree import Tree
+from .view import View
 
 
-Summarizer = Callable[[str], str]
+@dataclass(frozen=True)
+class CompactionRequest:
+    system: str
+    context: str
+    task: str
+    tools: list
+
+
+Summarizer = Callable[[CompactionRequest], str]
 
 
 class Compactor:
     def __init__(self, tree: Tree, summarize: Summarizer, *,
-                 node_bytes: int = 512, max_retries: int = 5):
+                 node_bytes: int = 512, max_retries: int = 5, view: View | None = None):
         if node_bytes <= 0 or max_retries <= 0:
             raise ValueError("Compaction budgets must be positive")
         self.tree = tree
         self.summarize = summarize
         self.node_bytes = node_bytes
         self.max_retries = max_retries
+        self.view = view
+        self.system: str = ""
+        self.tools: list = []
         self._pending: list[tuple[int, int]] = []
         self._queued: set[tuple[int, int]] = set()
         self._sources: dict[int, str] = {}
@@ -56,7 +69,7 @@ class Compactor:
         ):
             self.submit(*parent)
 
-    def _prompt(self, l: int, i: int) -> str | None:
+    def _request(self, l: int, i: int) -> CompactionRequest | None:
         if l == 0:
             source = self._sources.get(i)
             if source is None:
@@ -70,14 +83,19 @@ class Compactor:
             template = COMPACTION_MERGE_TASK
         task = template.format(id=i << l, count=1 << l, node_bytes=self.node_bytes,
                                ruler="-" * self.node_bytes, input=source)
-        return COMPACTION_SYSTEM.format(rubric=RUBRIC) + "\n\n" + task
+        return CompactionRequest(
+            system=self.system,
+            context=self.view.context_view() if self.view is not None else "",
+            task=COMPACTION_SYSTEM.format(rubric=RUBRIC) + "\n\n" + task,
+            tools=self.tools,
+        )
 
-    def _summarize(self, prompt: str, key: tuple[int, int]) -> str | None:
+    def _summarize(self, request: CompactionRequest, key: tuple[int, int]) -> str | None:
         shortest: str | None = None
-        task = prompt
+        task = request.task
         for _ in range(self.max_retries):
             try:
-                reply = self.summarize(task)
+                reply = self.summarize(replace(request, task=task))
             except Exception as exc:
                 warnings.warn(f"Compaction {key} failed: {exc}", RuntimeWarning, stacklevel=2)
                 return None
@@ -91,7 +109,7 @@ class Compactor:
             if length <= self.node_bytes:
                 return shortest
             prefix = line.encode("utf-8")[:self.node_bytes].decode("utf-8", errors="ignore")
-            task = prompt + "\n\n" + OVER_LENGTH_NOTICE.format(
+            task = request.task + "\n\n" + OVER_LENGTH_NOTICE.format(
                 actual_bytes=length, node_bytes=self.node_bytes, cut_point=prefix)
         return shortest
 
@@ -110,12 +128,12 @@ class Compactor:
                 continue
             free = self.tree.free_text(l, i)
             if free is None:
-                prompt = self._prompt(l, i)
-                if prompt is None:
+                request = self._request(l, i)
+                if request is None:
                     warnings.warn(f"Compaction {(l, i)} has no source", RuntimeWarning, stacklevel=2)
                     deferred.append((l, i))
                     continue
-                result = self._summarize(prompt, (l, i))
+                result = self._summarize(request, (l, i))
                 if result is None:
                     deferred.append((l, i))
                     continue

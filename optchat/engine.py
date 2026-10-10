@@ -27,7 +27,7 @@ except ModuleNotFoundError as exc:
     class ContextEngine:  # type: ignore[no-redef]
         """Standalone test base when the Hermes package is unavailable."""
 
-from .compactor import Compactor, Summarizer
+from .compactor import CompactionRequest, Compactor, Summarizer
 from .prompts import SYSTEM_PROMPT
 from .store import Log
 from .tree import Tree
@@ -47,7 +47,7 @@ def default_root() -> Path:
     return (Path(env) if env else Path.home() / ".hermes") / "optchat"
 
 
-def _missing_summarizer(_prompt: str) -> str:
+def _missing_summarizer(_request: CompactionRequest) -> str:
     raise RuntimeError("No OptChat summarizer has been configured")
 
 
@@ -73,6 +73,8 @@ class OptChatEngine(ContextEngine):
         self.tree: Tree | None = None
         self.view: View | None = None
         self.compactor: Compactor | None = None
+        self._turn_system = ""
+        self._turn_tools: list[dict[str, Any]] = []
         self._seen_messages = 0
         # Only a primary context writes. Subagents and cron runs read the view but must
         # never append to the chat: the host reports platform="subagent" / "cron" on
@@ -100,7 +102,10 @@ class OptChatEngine(ContextEngine):
             self.tree = Tree(self.root, self.node_bytes)
             self.view = View(self.tree, self.view_min_bytes, self.view_max_bytes)
             self.compactor = Compactor(self.tree, self.summarize or _missing_summarizer,
-                                       node_bytes=self.node_bytes)
+                                       node_bytes=self.node_bytes, view=self.view)
+            self._turn_tools = self.get_tool_schemas()
+            self.compactor.system = self._turn_system
+            self.compactor.tools = self._turn_tools
         except BaseException:
             self.log.close()
             self.log = None
@@ -132,7 +137,12 @@ class OptChatEngine(ContextEngine):
             if SYSTEM_PROMPT not in content:
                 system[0]["content"] = content + "\n\n" + SYSTEM_PROMPT
         turn = [copy.deepcopy(message) for message in request_messages[last_user:]]
-        _, _, view, _ = self._open()
+        _, _, view, compactor = self._open()
+        self._turn_system = _content_text(system[0].get("content"))
+        compactor.system = self._turn_system
+        if not hasattr(ContextEngine, "cache_plan"):
+            self._turn_tools = self.get_tool_schemas()
+        compactor.tools = self._turn_tools
         return system + [{"role": "assistant", "content": view.render()}] + turn
 
     def get_tool_schemas(self) -> list[dict[str, Any]]:
@@ -243,6 +253,8 @@ class OptChatEngine(ContextEngine):
             self.log, self.tree, self.view, self.compactor)
         clone._seen_messages = self._seen_messages
         clone._writes = self._writes
+        clone._turn_system = self._turn_system
+        clone._turn_tools = self._turn_tools
         for field in ("threshold_tokens", "context_length", "threshold_percent"):
             if hasattr(self, field):
                 setattr(clone, field, getattr(self, field))
@@ -252,6 +264,10 @@ class OptChatEngine(ContextEngine):
 if hasattr(ContextEngine, "cache_plan"):
     def _cache_plan(self: OptChatEngine, messages: list[dict[str, Any]],
                     tools: list[dict[str, Any]], **kwargs: Any) -> Any:
+        # A mismatched tool list breaks the turn cache prefix compaction reuses.
+        self._turn_tools = copy.deepcopy(tools)
+        if self.compactor is not None:
+            self.compactor.tools = self._turn_tools
         try:
             from agent.prompt_caching import (PromptCachePlan,
                 strip_anthropic_cache_control, strip_anthropic_tool_cache_control)

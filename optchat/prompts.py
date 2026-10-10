@@ -2,10 +2,11 @@
 
 The turn system prompt carries the five lines the spec names as doing the work.
 
-A compaction call is a single string for us (our ``Summarizer`` takes one prompt),
-so the spec's compaction *instructions* and its *task* are concatenated:
-``COMPACTION_SYSTEM.format(rubric=RUBRIC)`` then the task template. The spec sends
-them as a system prompt plus a task; one string is the same information.
+A compaction is a ``CompactionRequest``: ``system`` is the same system prompt a turn gets,
+``context`` is the ``<chat>`` context view, ``task`` is ``COMPACTION_SYSTEM`` (the spec's
+compaction instructions) followed by the task template, and ``tools`` are the same schemas
+a turn sends. The spec delivers the instructions as a system prompt and the task
+separately; carrying both in ``task`` is the same information.
 
 Deviations from the gist, deliberate and small: the level-0 task omits the
 ``{kind}:`` prefix (the source text is the message itself, and the rubric already

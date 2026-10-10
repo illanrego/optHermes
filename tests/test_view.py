@@ -113,3 +113,35 @@ def test_missing_view_is_created_once_from_tree(tmp_path):
     view = View(tree)
     assert [(line.l, line.i) for line in view.lines()] == [(1, 0)]
     assert (tmp_path / "view.json").exists()
+
+
+def test_context_view_merges_further_without_changing_live_pairs(tmp_path):
+    tree = Tree(tmp_path)
+    view = View(tree)
+    for i in range(64):
+        tree.put(0, i, "x" * 20)
+        level, index = 0, i
+        while index % 2:
+            parent = index // 2
+            tree.put(level + 1, parent, "merged")
+            level += 1
+            index = parent
+        view.add_root(i)
+    original = view.render()
+    pairs = view._pairs.copy()
+
+    context = view.context_view(min_bytes=100, max_bytes=200)
+
+    assert context.startswith("<chat>\n") and context.endswith("</chat>")
+    assert len(context.encode("utf-8")) <= 100
+    assert len(context.splitlines()) < len(original.splitlines())
+    assert view._pairs == pairs
+    assert view.render() == original
+
+
+def test_context_view_returns_fitting_view_unchanged(tmp_path):
+    tree = Tree(tmp_path)
+    view = View(tree)
+    tree.put(0, 0, "short")
+    view.add_root(0)
+    assert view.context_view() == view.render()
