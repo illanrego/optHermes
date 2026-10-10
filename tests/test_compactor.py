@@ -1,3 +1,5 @@
+import re
+import threading
 import time
 
 import pytest
@@ -74,6 +76,117 @@ def test_failed_summary_is_reported_and_unbuilt(tmp_path, summarize):
     with pytest.warns(RuntimeWarning):
         assert compactor.run_pending(limit=1) == 0
     assert tree.get(0, 0) is None
+
+
+def test_four_independent_summaries_run_at_once(tmp_path):
+    tree = Tree(tmp_path, node_bytes=8)
+    barrier = threading.Barrier(4, timeout=5)
+    lock = threading.Lock()
+    active = 0
+    maximum_active = 0
+
+    def summarize(_request):
+        nonlocal active, maximum_active
+        with lock:
+            active += 1
+            maximum_active = max(maximum_active, active)
+        try:
+            barrier.wait()
+            return "short"
+        except threading.BrokenBarrierError as exc:
+            raise AssertionError("Four summarizer calls did not meet the 5-second barrier") from exc
+        finally:
+            with lock:
+                active -= 1
+
+    compactor = Compactor(tree, summarize, node_bytes=8)
+    for i in range(4):
+        compactor.seed(i, "long source")
+
+    assert compactor.run_pending(limit=4) == 4, "Four calls must meet the 5-second barrier"
+    assert maximum_active == 4
+    assert all(tree.get(0, i) is not None for i in range(4))
+
+
+def test_limit_does_not_change_the_built_nodes(tmp_path):
+    snapshots = []
+    for limit in (1, 4):
+        tree = Tree(tmp_path / str(limit), node_bytes=6)
+        compactor = Compactor(tree, lambda _request: "abcd", node_bytes=6)
+        for i in range(4):
+            compactor.seed(i, "long source")
+        assert sum(compactor.run_pending(limit=limit) for _ in range(7)) == 7
+        snapshots.append(tree.nodes())
+
+    assert snapshots[0] == snapshots[1]
+    assert set(snapshots[0]) == {(0, i) for i in range(4)} | {(1, 0), (1, 1), (2, 0)}
+
+
+def test_one_pass_builds_the_same_nodes_regardless_of_finish_order(tmp_path):
+    snapshots = []
+    for delayed_pair in (0, 1):
+        tree = Tree(tmp_path / str(delayed_pair), node_bytes=6)
+
+        def summarize(request):
+            message = re.search(r"compress message (\d+)", request.task)
+            if message and int(message.group(1)) // 2 == delayed_pair:
+                time.sleep(0.02)
+            return "abcd"
+
+        compactor = Compactor(tree, summarize, node_bytes=6)
+        for i in range(4):
+            compactor.seed(i, "long source")
+        assert compactor.run_pending(limit=5) == 5
+        snapshots.append(tree.nodes())
+
+    assert snapshots[0] == snapshots[1]
+    assert set(snapshots[0]) == {(0, i) for i in range(4)} | {(1, 0)}
+
+
+def test_parent_request_follows_both_child_requests(tmp_path):
+    tree = Tree(tmp_path, node_bytes=6)
+    seen = []
+    lock = threading.Lock()
+
+    def summarize(request):
+        merge = re.search(r"merge the two lines under (\d+)\+(\d+)", request.task)
+        if merge:
+            start, count = map(int, merge.groups())
+            key = (count.bit_length() - 1, start // count)
+            assert all(tree.get(*child) is not None for child in tree.children(*key))
+        else:
+            message = re.search(r"compress message (\d+)", request.task)
+            assert message is not None
+            key = (0, int(message.group(1)))
+        with lock:
+            seen.append(key)
+        return "abcd"
+
+    compactor = Compactor(tree, summarize, node_bytes=6)
+    for i in range(4):
+        compactor.seed(i, "long source")
+    assert sum(compactor.run_pending(limit=4) for _ in range(3)) == 7
+
+    for parent in ((1, 0), (1, 1), (2, 0)):
+        assert all(seen.index(child) < seen.index(parent) for child in tree.children(*parent))
+
+
+def test_concurrent_summary_failure_leaves_only_affected_child_unbuilt(tmp_path):
+    tree = Tree(tmp_path, node_bytes=6)
+
+    def summarize(request):
+        if "compress message 0" in request.task:
+            raise RuntimeError("offline")
+        return "abcd"
+
+    compactor = Compactor(tree, summarize, node_bytes=6)
+    for i in range(4):
+        compactor.seed(i, "long source")
+    with pytest.warns(RuntimeWarning, match="offline"):
+        compactor.run_pending(limit=4)
+    assert tree.get(0, 0) is None
+    assert all(tree.get(0, i) is not None for i in range(1, 4))
+    assert tree.get(1, 0) is None
 
 
 def test_unready_parent_waits_for_both_children(tmp_path):

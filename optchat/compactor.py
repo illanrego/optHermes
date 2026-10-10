@@ -6,6 +6,7 @@ import heapq
 import time
 import warnings
 from collections.abc import Callable
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, replace
 
 from .prompts import (COMPACTION_MERGE_TASK, COMPACTION_SYSTEM, COMPACTION_TASK,
@@ -23,6 +24,7 @@ class CompactionRequest:
 
 
 Summarizer = Callable[[CompactionRequest], str]
+COMPACT_CONCURRENCY = 8
 
 
 class Compactor:
@@ -136,48 +138,85 @@ class Compactor:
             warnings.warn(f"Settle failed: {exc}", RuntimeWarning, stacklevel=2)
         return built
 
-    def run_pending(self, limit: int = 8, *, deadline: float | None = None,
+    def run_pending(self, limit: int = COMPACT_CONCURRENCY, *, deadline: float | None = None,
                     model_calls: bool = True) -> int:
-        """Build pending nodes.
+        """Build at most ``limit`` nodes, with up to ``limit`` model calls in flight.
 
         ``model_calls=False`` builds only nodes that need no model (``free_text``) and
         defers the rest. A synchronous caller must use it: the deadline is checked between
         nodes and cannot interrupt a summarizer call already in flight.
         """
-        if limit < 0:
-            raise ValueError("limit must be nonnegative")
+        if not isinstance(limit, int) or limit < 0:
+            warnings.warn("Compaction limit must be a nonnegative integer",
+                          RuntimeWarning, stacklevel=2)
+            return 0
+        if limit == 0:
+            return 0
         built = 0
         deferred: list[tuple[int, int]] = []
-        while (self._pending and built < limit
-               and (deadline is None or time.monotonic() < deadline)):
-            l, i = heapq.heappop(self._pending)
-            self._queued.remove((l, i))
-            if self.tree.get(l, i) is not None:
-                continue
-            if l > 0 and any(self.tree.get(*child) is None for child in self.tree.children(l, i)):
-                deferred.append((l, i))
-                continue
-            free = self.tree.free_text(l, i)
-            if free is None and not model_calls:
-                deferred.append((l, i))
-                continue
-            if free is None:
-                request = self._request(l, i)
-                if request is None:
-                    warnings.warn(f"Compaction {(l, i)} has no source", RuntimeWarning, stacklevel=2)
-                    deferred.append((l, i))
-                    continue
-                result = self._summarize(request, (l, i))
-                if result is None:
-                    deferred.append((l, i))
-                    continue
-            else:
-                result = free
-            self.tree.put(l, i, result)
-            if l == 0:
-                self._sources.pop(i, None)
-            built += 1
-            self._submit_ready_parent(l, i)
-        for key in deferred:
-            self.submit(*key)
+        try:
+            with ThreadPoolExecutor(max_workers=limit) as executor:
+                while (self._pending and built < limit
+                       and (deadline is None or time.monotonic() < deadline)):
+                    batch: list[tuple[tuple[int, int], Future[str | None]]] = []
+                    while (self._pending and built + len(batch) < limit
+                           and (deadline is None or time.monotonic() < deadline)):
+                        key = heapq.heappop(self._pending)
+                        self._queued.discard(key)
+                        l, i = key
+                        try:
+                            if self.tree.get(l, i) is not None:
+                                continue
+                            if l > 0 and any(self.tree.get(*child) is None
+                                             for child in self.tree.children(l, i)):
+                                deferred.append(key)
+                                continue
+                            free = self.tree.free_text(l, i)
+                            if free is not None:
+                                self.tree.put(l, i, free)
+                                built += 1
+                                self._submit_ready_parent(l, i)
+                                continue
+                            if not model_calls:
+                                deferred.append(key)
+                                continue
+                            request = self._request(l, i)
+                            if request is None:
+                                warnings.warn(f"Compaction {key} has no source",
+                                              RuntimeWarning, stacklevel=2)
+                                deferred.append(key)
+                                continue
+                            batch.append((key, executor.submit(self._summarize, request, key)))
+                        except Exception as exc:
+                            warnings.warn(f"Compaction {key} failed: {exc}",
+                                          RuntimeWarning, stacklevel=2)
+                            deferred.append(key)
+
+                    # All requests in this batch are already running. Applying their
+                    # results in queue order makes admission independent of finish order.
+                    for key, future in batch:
+                        try:
+                            result = future.result()
+                            if result is None:
+                                deferred.append(key)
+                                continue
+                            l, i = key
+                            self.tree.put(l, i, result)
+                            if l == 0:
+                                self._sources.pop(i, None)
+                            built += 1
+                            self._submit_ready_parent(l, i)
+                        except Exception as exc:
+                            warnings.warn(f"Compaction {key} failed: {exc}",
+                                          RuntimeWarning, stacklevel=2)
+                            deferred.append(key)
+        except Exception as exc:
+            warnings.warn(f"Compaction pass failed: {exc}", RuntimeWarning, stacklevel=2)
+        finally:
+            for key in deferred:
+                try:
+                    self.submit(*key)
+                except Exception as exc:
+                    warnings.warn(f"Compaction {key} could not be requeued: {exc}",
+                                  RuntimeWarning, stacklevel=2)
         return built
