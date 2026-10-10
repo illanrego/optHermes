@@ -79,12 +79,22 @@ class Compactor:
 Returns, for this request only:
 
 ```
-[system prompt] [<chat> view] [messages of THIS turn only]
+[system prompt] [assistant: <chat> view] [user: messages of THIS turn only]
 ```
 
 "THIS turn" = everything from the last user message onward. Every prior turn is
 dropped; the view stands in. Returns `None` when there is nothing to change.
 Never mutates `conversation_messages`.
+
+**The view MUST be an `assistant` message, not a `user` message.** Measured in
+slice 0 (`spike/slice0_shape_probe.py`): the host runs
+`_drop_thinking_only_and_merge_users` after this hook, and it merges adjacent
+`user` messages by concatenation with `"\n\n"`. A `user` view would be absorbed
+into the current turn's user message, which changes every turn, so the view could
+never be a stable prompt-cache prefix and the design's economics break. Shapes
+that survive: `assistant` view (chosen); a second `system` message (provider-
+dependent, not chosen); a `user` view separated by an empty `system` message
+(needs an empty message, not chosen).
 
 ```python
 class OptChatEngine(ContextEngine):

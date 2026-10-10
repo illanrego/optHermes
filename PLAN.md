@@ -14,9 +14,10 @@ path.
 ## Prep (no budget, done by Hermes)
 
 - [x] Freeze the contract (`CONTRACT.md`) and the spec restatement (`docs/optchat-spec.md`).
-- [ ] Fork `hermes-agent` under `illanrego`. Add a **git worktree** off the existing checkout (`~/Documents/coding/opthermes-seam`) on branch `feat/context-engine-cache-seam` — reuses the local objects, no 1.2 GB re-download.
-- [ ] Create an isolated `HERMES_HOME` (e.g. `~/.hermes/profiles/optchat-dev`) for testing. Never touch the live profile.
-- [ ] Confirm the Codex invocation: `$(npm prefix -g)/bin/codex`, `--approve-for-me`, `-m <slug>`, `-o <file>`, `pty=true`.
+- [x] Forked `hermes-agent` to `illanrego`, `fork` remote added. Worktree at `~/Documents/coding/opthermes-seam` on `feat/context-engine-cache-seam` (off `origin/main`). No clone, no re-download.
+- [x] Slice 0 spike run against the real host functions with the repo's own venv (`~/.hermes/hermes-agent/venv`) — no profile, no model, no tokens.
+- [x] Codex confirmed: `codex-cli 0.157.1` at `$(npm prefix -g)/bin/codex`; models `gpt-6-astra` / `gpt-6-sol` / `gpt-6-reserve` / `gpt-6-luna`.
+- [ ] Isolated `HERMES_HOME` (`~/.hermes/profiles/opthermes-dev`) — still needed for slices 4 and 5 (live session).
 
 ## Slices
 
@@ -94,7 +95,30 @@ the budget off them.
 
 ## Findings
 
-_(slice 0, slice 5 write here)_
+### Slice 0 — done, no budget spent (`spike/`)
+
+Run: `PYTHONPATH=~/Documents/coding/opthermes-seam ~/.hermes/hermes-agent/venv/bin/python3 spike/slice0_swap_probe.py`
+(the repo's own venv; no profile, no model, no tokens).
+
+- **The swap works.** `_apply_context_engine_selection` honors `select_context`;
+  the return replaces the request; persisted history is untouched. A non-overriding
+  engine is short-circuited by an identity check; `[]` and exceptions fail open.
+- **The replacement is not final.** After the hook the pipeline still runs
+  `apply_rejected_thinking_suppression`, `_sanitize_api_messages`,
+  `evict_stale_outbound_tool_images`, `_drop_thinking_only_and_merge_users`,
+  a whitespace `.strip()` of every content string, tool-call canonicalization and
+  surrogate stripping.
+- **Adjacent `user` messages always merge** (concatenated with `"\n\n"`), so a
+  `user` view is absorbed into the current turn and can never be a stable cache
+  prefix. Measured in `spike/slice0_shape_probe.py`:
+  - `[system][user:view][user:msg]` -> merged. Rejected.
+  - `[system][assistant:view][user:msg]` -> survives. **Chosen.**
+  - `[system][system:view][user:msg]` -> survives (second system message:
+    provider-dependent, not chosen).
+  - `[system][user:view][system:""][user:msg]` -> survives (needs an empty
+    message, not chosen).
+- The engine instance lives at `agent.context_compressor`; the hook is RFC #36765;
+  the suite to extend is `tests/agent/test_context_engine_select_context.py`.
 
 ## Open questions
 
