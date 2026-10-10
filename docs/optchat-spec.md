@@ -98,10 +98,41 @@ prompt and tools** (never called), so it reads the turns' cache entry:
 ```
 
 - Its view is the chat's view merged further, to 16-32 KB, same sawtooth.
-- The task names the message or the two lines, gives a ruler of 512 dashes
-  (models cannot count bytes), and the input.
-- If the reply is over 512 bytes, resend with the over-length notice and the
-  cut point; try at most 5 times and keep the shortest line.
+- The task is the spec's, **verbatim** (the ruler is 512 dashes):
+
+```
+Compaction: compress message {id} into one line of at most 512 bytes
+(about 70 words), the length of this ruler:
+------------…------------
+<input>
+{kind}: {the message, whole}
+</input>
+```
+
+```
+Compaction: merge lines {a} and {b}, adjacent, into one line of at most
+512 bytes (about 70 words), the length of this ruler:
+------------…------------
+<chat> may hold their messages, {id} to {end}, in more detail: take details
+of them from there too.
+<input>
+{line a}
+{line b}
+</input>
+```
+
+- If the reply is over 512 bytes, resend with this notice, verbatim:
+
+```
+Too long: your line is {N} bytes, over the 512-byte limit. Write
+the whole line again for the same <input>, cutting just enough of the
+least valuable items to fit before this cut:
+{its first 512 bytes}| ← LIMIT
+```
+
+  Try at most 5 times, and keep the shortest line. A few bytes over is fine,
+  because the view measures real sizes. A failed call is tried again at the next
+  message.
 - Up to 8 calls at once. A message's node starts once fewer than 8 lines before
   it are unbuilt; a merge starts once both halves are built. A compaction's view
   stops at the first unbuilt line, so no call sees a placeholder.

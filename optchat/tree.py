@@ -59,6 +59,14 @@ class Tree:
     def get(self, l: int, i: int) -> Line | None:
         return self._nodes.get((l, i))
 
+    def nodes(self) -> dict[tuple[int, int], Line]:
+        """A copy of every built node, keyed by ``(level, index)``.
+
+        A copy, not the live mapping: callers must not be able to write into the
+        tree's internals.
+        """
+        return dict(self._nodes)
+
     def children(self, l: int, i: int) -> tuple[tuple[int, int], tuple[int, int]]:
         if l < 1 or i < 0:
             raise ValueError("Only positive-level nodes have children")
