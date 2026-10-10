@@ -31,6 +31,7 @@ except ModuleNotFoundError as exc:
 from .compactor import CompactionRequest, Compactor, Summarizer
 from .prompts import SYSTEM_PROMPT
 from .store import Log
+from .text import split_text
 from .tree import Tree
 from .view import View
 from . import tools as opt_tools
@@ -189,10 +190,11 @@ class OptChatEngine(ContextEngine):
         return json.dumps({"error": f"Unknown context engine tool: {name}"})
 
     @staticmethod
-    def _records(message: dict[str, Any]) -> list[tuple[str, str]]:
+    def _records(message: dict[str, Any], node_bytes: int) -> list[tuple[str, str]]:
         role = message.get("role")
         if role == "user":
-            return [("user", _content_text(message.get("content")))]
+            return [("user", chunk) for chunk in split_text(
+                _content_text(message.get("content")), node_bytes)]
         if role == "tool":
             text = _content_text(message.get("content"))
             if len(text) > 30_000:
@@ -217,7 +219,7 @@ class OptChatEngine(ContextEngine):
             return records
         if role == "assistant":
             content = _content_text(message.get("content"))
-            return [("unii", content)] if content else []
+            return [("unii", chunk) for chunk in split_text(content, node_bytes)] if content else []
         return []
 
     def on_turn_complete(self, messages: list[dict[str, Any]], usage: dict[str, Any] | None = None,
@@ -232,7 +234,7 @@ class OptChatEngine(ContextEngine):
         if len(messages) < self._seen_messages:
             self._seen_messages = 0
         for message in messages[self._seen_messages:]:
-            for kind, text in self._records(message):
+            for kind, text in self._records(message, self.node_bytes):
                 index = log.append(kind, text)
                 compactor.seed(index, text)
                 view.add_root(index)

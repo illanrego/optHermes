@@ -88,14 +88,30 @@ def test_tool_mapping_and_json_errors(tmp_path):
     assert "error" in json.loads(engine.handle_tool_call("optchat_date", {"id": -1}))
 
 
-def test_large_message_uses_summarizer_and_raw_message_survives(tmp_path):
+def test_long_user_message_is_logged_as_consecutive_free_records(tmp_path):
     summarizer = FakeSummarizer()
     engine = OptChatEngine(tmp_path, node_bytes=32, summarize=summarizer)
-    text = "x" * 80
+    text = "one two three four five six seven eight nine ten eleven twelve"
     engine.on_turn_complete([{"role": "user", "content": text}])
-    assert engine.log.get(0).text == text
-    assert engine.tree.get(0, 0).text == "summary"
-    assert len(summarizer.prompts) == 1
+    records = engine.log.range(0, engine.log.count() - 1)
+    chunks = [record.text for record in records]
+    assert len(records) > 1
+    assert all(record.kind == "user" and record.size <= 32 for record in records)
+    assert "".join(chunks).split() == text.split()
+    assert all(engine.tree.get(0, record.id).text == record.text for record in records)
+    assert not any("compress message" in prompt.task for prompt in summarizer.prompts)
+
+
+def test_long_assistant_text_splits_but_tool_result_keeps_its_clip(tmp_path):
+    engine = OptChatEngine(tmp_path, node_bytes=32, summarize=FakeSummarizer())
+    assistant = "alpha beta gamma delta epsilon zeta eta theta"
+    assistant_records = engine._records({"role": "assistant", "content": assistant}, 32)
+    assert len(assistant_records) > 1
+    assert all(kind == "unii" and len(chunk.encode("utf-8")) <= 32
+               for kind, chunk in assistant_records)
+    assert "".join(chunk for _, chunk in assistant_records) == assistant
+    tool_records = engine._records({"role": "tool", "content": "x" * 30_002}, 32)
+    assert tool_records == [("echo", "x" * 30_000)]
 
 
 def _short_chat(n):
@@ -108,7 +124,7 @@ def test_selection_never_starts_a_model_call(tmp_path):
     needing a model is left to the background, and the view may hold a placeholder."""
     summarizer = FakeSummarizer()
     engine = OptChatEngine(tmp_path, node_bytes=32, summarize=summarizer)
-    engine.on_turn_complete([{"role": "user", "content": "x" * 80} for _ in range(9)])
+    engine.on_turn_complete([{"role": "tool", "content": "x" * 80} for _ in range(9)])
     before = len(summarizer.prompts)
     assert not engine.view.settled()
 
@@ -124,7 +140,7 @@ def test_end_of_turn_compaction_settles_the_view(tmp_path):
     settled. The pass is bounded at 8 model nodes per turn."""
     summarizer = FakeSummarizer()
     engine = OptChatEngine(tmp_path, node_bytes=32, summarize=summarizer)
-    engine.on_turn_complete([{"role": "user", "content": "x" * 80}])
+    engine.on_turn_complete([{"role": "tool", "content": "x" * 80}])
 
     assert engine.tree.get(0, 0).text == "summary"
     assert engine.view.settled()
@@ -155,11 +171,11 @@ def test_withheld_transcript_can_be_recovered_from_view_and_zoom(tmp_path):
 
     engine = OptChatEngine(tmp_path, node_bytes=80, summarize=CueSummarizer())
     secret = "The project codename is ORCHID-17. " + "x" * 100
-    engine.on_turn_complete([{"role": "user", "content": secret},
+    engine.on_turn_complete([{"role": "tool", "content": secret},
                              {"role": "assistant", "content": "I will remember it."}])
     selected = engine.select_context([
         {"role": "system", "content": "host"},
-        {"role": "user", "content": secret},
+        {"role": "tool", "content": secret},
         {"role": "assistant", "content": "I will remember it."},
         {"role": "user", "content": "What was the codename?"}])
     assert len(selected) == 3
