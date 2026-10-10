@@ -182,3 +182,86 @@ Admission / fail-closed selection, media and asset archiving, backup and
 migration UX, catalog submission, multi-provider cache marks, replay/report
 tooling. With admission parked, a turn may start before the view settles: v1
 accepts a slightly stale view.
+
+---
+
+# Revision 2 - fidelity fixes (2026-10-10)
+
+An audit against the original gist found the **memory** half faithful and the
+**navigation** half thin. These supersede the interfaces above where they differ.
+
+## Tool names
+
+The registered tools are `optchat_zoom` and `optchat_date` - namespaced on purpose, since
+a bare `zoom`/`date` is collision-prone. **The prompt must name them exactly as
+registered.** The canonical prompt's `zoom(id, n)` wording is adapted, not copied. This
+was broken: the prompt named `zoom`/`date` and navigation could not work at all.
+
+## The turn prompt
+
+`SYSTEM_PROMPT` must carry what the original puts in the model's head:
+
+- the view's line format - `id+n|text` means the `n` messages from `id` on, oldest
+  first, inside `<chat>`, newlines as spaces;
+- the kinds list (`user`, `unii`, `tool`, `echo`, `work`, `note`);
+- that an unsummarized message shows as `(not summarized yet: zoom it)`;
+- `optchat_zoom(id, n)` opens line `id+n` into the two lines under it;
+  `optchat_zoom(id, 1)` gives the message whole; `optchat_date(id)` gives its time;
+- "The view is your memory, and its latest word on a thing is the truth";
+- "Never grep or search memories manually; `optchat_zoom` is your only allowed mechanism
+  to navigate the tree";
+- the five behavioural lines the spec names, verbatim.
+
+Missing any of these means the model cannot navigate the view.
+
+## Compaction calls are shaped like turns
+
+A compaction is a call shaped like a turn, so it reads the turns' cache entry.
+
+```python
+@dataclass(frozen=True)
+class CompactionRequest:
+    system: str    # the same system prompt a turn gets
+    context: str   # the <chat> context view, merged further (COMPACT_VIEW_* bytes)
+    task: str      # the compaction task
+    tools: list    # the same tool schemas a turn sends (never called)
+
+Summarizer = Callable[[CompactionRequest], str]
+```
+
+- `View.context_view(min_bytes=COMPACT_VIEW_MIN_BYTES, max_bytes=COMPACT_VIEW_MAX_BYTES) -> str`
+  returns the chat's view merged further, rendered as `<chat>...</chat>`.
+- The engine supplies the last assembled turn system text and the host's tool schemas.
+- `make_host_summarizer` sends them through the aux route: the system as a system
+  message, the context and task as the user message, and `tools` passed through.
+
+## Admission (settle)
+
+Before a turn is served, every message before the current one must be summarized.
+`select_context` runs a bounded settle - `Compactor.settle(max_nodes, timeout_s)` - and
+serves what it has when the bound is hit. Stock Hermes has no fail-closed sentinel, so the
+bound is the guard; the seam's `ContextSelectionBlocked` stays a later upgrade.
+
+## Kinds
+
+- `work`: a delegated child's report. Detected from a tool result whose call name is
+  `delegate_task` (track tool-call id -> name while ingesting).
+- `note`: memories imported from before the chat.
+  `optchat.import_notes(log, compactor, view, texts)` appends each as a `note` record, so
+  a new chat can start with the past.
+
+## Long text
+
+Text longer than `NODE_BYTES` is **split** into consecutive records of at most
+`NODE_BYTES` (at a whitespace boundary when one exists), never cut. Tool results keep
+their head+tail clip instead.
+
+## Concurrency
+
+`Compactor.run_pending` may run up to `COMPACT_CONCURRENCY` summarizer calls at once,
+preserving build-once and the children-before-parent rule.
+
+## Still parked
+
+Media and asset archiving; per-subagent logs and `zoom("Name")` (children do not write, so
+there is no child log to open); catalog submission; multi-provider cache marks.
