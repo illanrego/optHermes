@@ -36,7 +36,7 @@ the exact call-site findings (order relative to cache decoration, whether the
 turn-local tail survives).
 **Done when:** the finding is written into this file under "Findings".
 
-### Slice 1 — The seam (gpt-6-sol, high effort)
+### Slice 1 — The seam ✅ done (gpt-6-astra, high effort)
 
 **Objective:** the 4-file PR candidate.
 **Files:** as in `CONTRACT.md` § The seam.
