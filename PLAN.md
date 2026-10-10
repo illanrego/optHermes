@@ -137,7 +137,40 @@ Run: `PYTHONPATH=~/Documents/coding/opthermes-seam ~/.hermes/hermes-agent/venv/b
   leaves the node unbuilt.
 - Repairs made in review: `view.py` no longer reaches into `Tree._nodes` (new
   `Tree.nodes()`); the prompt wording was rewritten to the spec's canonical text and the
-  tests updated to match.
+  tests were updated to match.
+
+### Slices 4a-4b — the engine is live, and the cache is real
+
+Live in the isolated profile `opthermes-dev`, real calls on the user's
+opencode-go / `deepseek-v4-flash` route:
+
+- **The engine registers.** It ingests turns, builds free and model-written nodes, and
+  persists `main/`, `tree/` and `view.json` under `<profile>/optchat/`. No fallback to
+  the built-in compressor.
+- **Compaction runs on the host's auxiliary route.** `state.db` shows
+  `task='optchat'`, `provider='opencode-go'`, `model='deepseek-v4-flash'` - inherited
+  from the main model with no config.
+- **The cache works, inside one session.** One session's main turn made two API calls:
+  ~16,363 input tokens total, of which **16,000 were cache reads**. The second call paid
+  for roughly 200 new tokens. That is the whole economic bet, measured, and it needs no
+  cache marks on this route (DeepSeek caches by prefix).
+- **It does NOT work across separate sessions.** Two one-shot runs minutes apart both
+  reported `cache_read_tokens = 0`: the host's per-session prompt block differs, so the
+  prefix never matches. The benefit needs a *continuous* session - the intended shape
+  (one endless chat) - and the README should say so plainly.
+- **The compactor is expensive on a reasoning model.** One compaction call produced
+  **9,483 output tokens** (mostly reasoning) to write a single 512-byte line. Pin
+  `auxiliary.optchat` to a cheaper or low-effort model. Config recommendation, not a bug.
+- Also measured: the host's own prompt is ~16k tokens before our view. The engine
+  replaces the *history*, not the system prompt or the tool schemas, so the saving scales
+  with how much history the session would otherwise carry.
+
+Two review catches worth keeping: the engine's `register()` could not read the Hermes home
+from the context-engine loader (it passes a minimal collector with no plugin manager), so
+registration silently fell back to the built-in compressor - fixed with `default_root()`
+and an optional `root`; and `on_turn_complete` had to gate on the host's
+`platform="subagent"/"cron"` signal, or a `delegate_task` child would have written its own
+turns into the chat.
 
 ## Open questions
 
