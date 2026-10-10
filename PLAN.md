@@ -172,6 +172,58 @@ and an optional `root`; and `on_turn_complete` had to gate on the host's
 `platform="subagent"/"cron"` signal, or a `delegate_task` child would have written its own
 turns into the chat.
 
+## Audit vs the original gist (2026-10-10)
+
+The **memory** half is faithful; the **navigation** half was thin. Findings and their state:
+
+### Was broken (fixed)
+
+- **Tool names.** The prompt named `zoom`/`date`; the tools register as `optchat_zoom` /
+  `optchat_date`, so navigation could not work at all. Fixed; a test now reads the names out
+  of the engine's schemas and asserts each appears in the prompt.
+- **The prompt was a paraphrase.** It omitted the view's line format (`id+n|text`), the
+  kinds, the `(not summarized yet: zoom it)` rule, "the latest word is the truth" and
+  "zoom is your only allowed mechanism". Fixed.
+
+### Was missing (fixed in revision 2)
+
+- Compaction calls shaped like turns: the same system prompt and tools, plus a `<chat>`
+  context view - so they read the turns' cache entry, and so the merge template's
+  "`<chat>` may hold their messages in more detail" stops referring to nothing.
+- Admission: settle the view before serving a turn, so a turn cannot start on a placeholder.
+- The `work` and `note` kinds.
+- Long text split into several messages, never cut.
+- Compaction concurrency: up to 8 calls at once.
+
+### Different by necessity (documented, defensible)
+
+- The view is an `assistant` message - forced by Hermes merging adjacent `user` messages
+  (measured in slice 0).
+- The original has one prompt for turns and compactions; we split it into `SYSTEM_PROMPT`
+  and `COMPACTION_SYSTEM`. Same information, different shape.
+- The prompt names the registered tools, not the gist's bare `zoom`/`date` (namespacing is
+  deliberate: a bare `zoom` is collision-prone).
+
+### Still parked, with the reason
+
+- **Per-subagent logs and `zoom("Name")`.** The spec keeps each subagent's steps in its own
+  log; we gate children out of writing entirely, so there is no child log to open. Doing it
+  properly means giving each child its own root plus a `work` record that can resolve back
+  to it - a feature, not a fix.
+- **Media and images** (`zoom(id, 1)` "gives message id whole, with its images"): needs the
+  host's media plumbing.
+- Catalog submission; multi-provider cache marks.
+
+### Faithful, verified
+
+Log rules (append-only, one writer, fsync, day-split, thoughts never logged, tool output
+clipped head+tail 30k) · 512-byte nodes, build-once, free short nodes · `due` from the
+pair's last message (push-equivalence through 2000) · the 64-128 KB sawtooth · persisted
+view, never rebuilt · no dates in the view · the placeholder line · the ruler and the at
+most 5 attempts keeping the shortest · the rubric's priority order · the five behavioural
+lines · `zoom(id, n)` semantics · the cache discipline (16,000 of ~16,363 input tokens read
+from cache inside one session).
+
 ## Open questions
 
 - ~~Does the host's sanitizer or cache-control pass alter a replaced list in a way the
