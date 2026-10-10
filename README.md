@@ -1,4 +1,4 @@
-# OptChat for Hermes (working name)
+# optHermes
 
 Hermes keeps the body. We replace the memory and context subsystem with
 OptChat's philosophy, through public seams.

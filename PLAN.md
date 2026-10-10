@@ -14,7 +14,7 @@ path.
 ## Prep (no budget, done by Hermes)
 
 - [x] Freeze the contract (`CONTRACT.md`) and the spec restatement (`docs/optchat-spec.md`).
-- [ ] Fork `hermes-agent` under `illanrego`, clone to `~/Documents/coding/hermes-agent-optchat`, branch `feat/context-engine-cache-seam`.
+- [ ] Fork `hermes-agent` under `illanrego`. Add a **git worktree** off the existing checkout (`~/Documents/coding/opthermes-seam`) on branch `feat/context-engine-cache-seam` — reuses the local objects, no 1.2 GB re-download.
 - [ ] Create an isolated `HERMES_HOME` (e.g. `~/.hermes/profiles/optchat-dev`) for testing. Never touch the live profile.
 - [ ] Confirm the Codex invocation: `$(npm prefix -g)/bin/codex`, `--approve-for-me`, `-m <slug>`, `-o <file>`, `pty=true`.
 
