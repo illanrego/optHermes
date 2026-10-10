@@ -53,6 +53,19 @@ def default_root() -> Path:
     return (Path(env) if env else Path.home() / ".hermes") / "optchat"
 
 
+def _load_config(root: Path) -> dict[str, Any]:
+    """The engine's size knobs, from ``<root>/config.json`` when it exists.
+
+    A missing, unreadable or malformed file is ignored rather than fatal: the engine must
+    still start with its defaults.
+    """
+    try:
+        data = json.loads((Path(root) / "config.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
 def _missing_summarizer(_request: CompactionRequest) -> str:
     raise RuntimeError("No OptChat summarizer has been configured")
 
@@ -85,13 +98,17 @@ def _delegate_name(text: str) -> str:
 
 
 class OptChatEngine(ContextEngine):
-    def __init__(self, root: Path | None = None, *, view_min_bytes: int = 64_000,
-                 view_max_bytes: int = 128_000, node_bytes: int = 512,
+    def __init__(self, root: Path | None = None, *, view_min_bytes: int | None = None,
+                 view_max_bytes: int | None = None, node_bytes: int | None = None,
                  summarize: Summarizer | None = None):
         self.root = Path(root) if root is not None else default_root()
-        self.view_min_bytes = view_min_bytes
-        self.view_max_bytes = view_max_bytes
-        self.node_bytes = node_bytes
+        config = _load_config(self.root)
+        # The profile's config.json supplies the sizes; an explicit argument wins over it.
+        self.view_min_bytes = (view_min_bytes if view_min_bytes is not None
+                               else config.get("view_min_bytes", 64_000))
+        self.view_max_bytes = (view_max_bytes if view_max_bytes is not None
+                               else config.get("view_max_bytes", 128_000))
+        self.node_bytes = node_bytes if node_bytes is not None else config.get("node_bytes", 512)
         self.summarize = summarize
         self.log: Log | None = None
         self.tree: Tree | None = None
