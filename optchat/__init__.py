@@ -14,15 +14,18 @@ def register(ctx) -> None:
 
     The context-engine directory loader passes a minimal collector: it exposes
     ``register_context_engine`` but carries no plugin manager, so the Hermes home
-    cannot be read from ``ctx``. Fall back to ``default_root()`` (the launcher's
-    HERMES_HOME), which keeps the engine profile-scoped.
+    cannot be read from ``ctx``. When no manager home is available, pass no root:
+    the engine then resolves its chat directory from the ``hermes_home`` the host
+    supplies at session start, falling back to ``default_root()`` (the launcher's
+    HERMES_HOME). Passing ``default_root()`` here would freeze the ambient home and
+    the host's own home could never take precedence.
     """
     register_engine = getattr(ctx, "register_context_engine", None)
     if not callable(register_engine):
         return
     manager = getattr(ctx, "_manager", None)
     home = getattr(manager, "home_path", None) if manager is not None else None
-    root = (Path(home) / "optchat") if home is not None else default_root()
+    root = (Path(home) / "optchat") if home is not None else None
 
     engine = OptChatEngine(root)
     try:

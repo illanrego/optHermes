@@ -3,6 +3,7 @@
 import copy
 import json
 import logging
+from pathlib import Path
 
 from optchat import OptChatEngine
 from optchat.prompts import SYSTEM_PROMPT
@@ -40,6 +41,36 @@ def test_selection_keeps_only_current_turn_and_does_not_mutate_history(tmp_path)
     assert selected[-1] == request[-1]
     assert history == before
     assert engine.select_context(selected)[0]["content"] == selected[0]["content"]
+
+
+def test_selection_keeps_task_and_tool_work_across_steering(tmp_path):
+    engine = OptChatEngine(tmp_path, summarize=FakeSummarizer())
+    task = {"role": "user", "content": {"text": "original task"}}
+    request = [{"role": "system", "content": "host"},
+               {"role": "user", "content": "older turn"}, task,
+               {"role": "assistant", "tool_calls": [{"id": "call-1"}]},
+               {"role": "tool", "content": "current tool work", "tool_call_id": "call-1"},
+               {"role": "user", "content": "steering"}]
+    history = copy.deepcopy(request)
+    request_before = copy.deepcopy(request)
+    history_before = copy.deepcopy(history)
+
+    for incoming in (task, copy.deepcopy(task)):
+        selected = engine.select_context(request, conversation_messages=history,
+                                         incoming_message=incoming)
+        assert selected[2:] == request[2:]
+    assert engine.select_context(request, incoming_message={"role": "user", "content": "missing"})[2:] == request[-1:]
+    assert engine.select_context(request)[2:] == request[-1:]
+    assert request == request_before
+    assert history == history_before
+
+
+def test_selection_prefers_incoming_identity_over_an_equal_earlier_row(tmp_path):
+    engine = OptChatEngine(tmp_path, summarize=FakeSummarizer())
+    task = {"role": "user", "content": "same words"}
+    request = [copy.deepcopy(task), task, {"role": "user", "content": "steering"}]
+
+    assert engine.select_context(request, incoming_message=task)[2:] == request[1:]
 
 
 def test_selection_no_change_and_stable_prefix(tmp_path):
@@ -290,3 +321,51 @@ def test_primary_context_writes(tmp_path):
     engine.on_turn_complete([{"role": "user", "content": "hello"}])
     assert engine.log.count() == 1
     assert engine.log.get(0).kind == "user"
+
+
+def test_session_start_uses_host_home_and_its_config(tmp_path, monkeypatch):
+    ambient = tmp_path / "ambient"
+    active = tmp_path / "active"
+    monkeypatch.setenv("HERMES_HOME", str(ambient))
+    (active / "optchat").mkdir(parents=True)
+    (active / "optchat" / "config.json").write_text('{"node_bytes": 64}')
+    engine = OptChatEngine(summarize=FakeSummarizer())
+
+    engine.on_session_start("session", hermes_home=active)
+
+    assert engine.root == active / "optchat"
+    assert engine.log.root == active / "optchat"
+    assert engine.node_bytes == 64
+    assert not (ambient / "optchat").exists()
+
+
+def test_explicit_root_wins_over_host_home(tmp_path):
+    root = tmp_path / "explicit"
+    engine = OptChatEngine(root, summarize=FakeSummarizer())
+
+    engine.on_session_start("session", hermes_home=tmp_path / "active")
+
+    assert engine.root == root
+    assert engine.log.root == root
+
+
+def test_session_start_falls_back_to_environment_home(tmp_path, monkeypatch):
+    home = tmp_path / "ambient"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    engine = OptChatEngine(summarize=FakeSummarizer())
+
+    engine.on_session_start("session")
+
+    assert engine.root == home / "optchat"
+    assert engine.log.root == home / "optchat"
+
+
+def test_session_start_falls_back_to_default_home(tmp_path, monkeypatch):
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    engine = OptChatEngine(summarize=FakeSummarizer())
+
+    engine.on_session_start("session")
+
+    assert engine.root == tmp_path / ".hermes" / "optchat"
+    assert engine.log.root == engine.root

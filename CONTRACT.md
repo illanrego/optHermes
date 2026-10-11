@@ -101,9 +101,13 @@ Returns, for this request only:
 [system prompt] [assistant: <chat> view] [user: messages of THIS turn only]
 ```
 
-"THIS turn" = everything from the last user message onward. Every prior turn is
-dropped; the view stands in. Returns `None` when there is nothing to change.
-Never mutates `conversation_messages`.
+"THIS turn" = everything from the message the host passes as `incoming_message`
+onward, located in `request_messages` by identity and then by equality. When that
+message is absent or cannot be located, it falls back to the last user row. (rev 4:
+the host inserts steering messages as later user rows, so anchoring to the last user
+row dropped the original task and the current tool work from the request before they
+were ever ingested.) Every prior turn is dropped; the view stands in. Returns `None`
+when there is nothing to change. Never mutates `conversation_messages`.
 
 **The view MUST be an `assistant` message, not a `user` message.** Measured in
 slice 0 (`spike/slice0_shape_probe.py`): the host runs
@@ -315,3 +319,32 @@ message. We kept "out of the chat" and deleted "its own log", which is exactly t
 ## Not ours
 
 Catalog submission (distribution) and multi-provider cache marks (host-side).
+
+---
+
+# Revision 4 - the turn boundary is the host's, not the last user row (2026-10-11)
+
+Three defects, fixed in WP1.
+
+## The turn boundary
+
+The host inserts a **steering** message as another `user` row after a tool result. Anchoring "this
+turn" to the last user row therefore dropped everything before it - the original task and the
+current tool work - from the request *before it was ever ingested*, so the model lost the task
+mid-turn. The host already passes the real boundary as `incoming_message`
+(`conversation_loop._apply_context_engine_selection`, computed at `current_turn_user_idx` in
+`turn_request_assembly`). The tail now starts at that message, located by identity first and by
+equality second; the last-user rule remains the fallback when it is absent or cannot be located.
+
+## A reasoning-only reply is never a summary
+
+`summarizer.py` used the host's `extract_content_or_reasoning`, whose reasoning fallback let a
+reasoning blob be persisted as a tree line - and the design never logs thoughts. Only ordinary
+content can become a line now; a reasoning-only reply raises, and the node stays unbuilt.
+
+## The home comes from the host
+
+`default_root()` read `HERMES_HOME` from the environment. The engine now defers to the
+`hermes_home` the host supplies at session start, keeps an explicit constructor root as the
+override, and falls back to the environment only when neither exists. `register()` therefore
+passes **no root** when there is no manager home, instead of freezing the ambient one.

@@ -23,8 +23,13 @@ open as PR #136135.
 - The engine replaces the **history**, not the host's system prompt or tool schemas
   (~16k tokens before the view), so the saving scales with how much history the session
   would otherwise carry.
-- Pin `auxiliary.optchat` to a cheap or low-effort model: one compaction on a reasoning
-  model burned 9,483 output tokens for a single 512-byte line.
+- **Keep the compaction on the same provider and model as the turns, and lower its reasoning
+  effort instead.** One compaction on a reasoning model burned 9,483 output tokens for a single
+  512-byte line - but pinning a *different* model would break the shared prompt cache the design
+  rests on, since a compaction is supposed to read the turns' cache entry through its
+  tools+system prefix. `auxiliary.optchat.reasoning_effort: minimal` is the lever, not a
+  different model. With `provider: auto` (the default) the compaction follows whatever model the
+  turns use - a local one included.
 
 ## Layout
 

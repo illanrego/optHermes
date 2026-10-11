@@ -6,6 +6,10 @@ becomes tool (name and JSON arguments, including any accompanying content);
 delegate_task results become work, and other tool results become echo.
 Thinking fields are never logged.
 
+The retained request tail starts at the host's ``incoming_message`` when that
+message is present in the request (identity first, then equality). Otherwise it
+starts at the last user row. A later steering user row stays in the same turn.
+
 The host ABC is imported here, rather than by the package entry point. When
 Hermes is absent, a local base permits standalone unit tests; an engine loaded
 inside Hermes inherits the real ABC. This binding is fixed at module import.
@@ -43,13 +47,7 @@ logger = logging.getLogger(__name__)
 
 
 def default_root() -> Path:
-    """The chat directory for the active Hermes home.
-
-    The context-engine directory loader hands a plugin a minimal collector with no
-    plugin manager, so the home cannot be read from ``ctx``. The launcher exports
-    HERMES_HOME for the active profile, which is the same value, and reading it here
-    keeps the engine profile-scoped.
-    """
+    """Fallback chat directory when no constructor root or host home is supplied."""
     env = os.environ.get("HERMES_HOME")
     return (Path(env) if env else Path.home() / ".hermes") / "optchat"
 
@@ -105,8 +103,9 @@ class OptChatEngine(ContextEngine):
     def __init__(self, root: Path | None = None, *, view_min_bytes: int | None = None,
                  view_max_bytes: int | None = None, node_bytes: int | None = None,
                  summarize: Summarizer | None = None):
-        self.root = Path(root) if root is not None else default_root()
-        config = _load_config(self.root)
+        self.root = Path(root) if root is not None else None
+        self._size_overrides = (view_min_bytes, view_max_bytes, node_bytes)
+        config = _load_config(self.root) if self.root is not None else {}
         # The profile's config.json supplies the sizes; an explicit argument wins over it.
         self.view_min_bytes = (view_min_bytes if view_min_bytes is not None
                                else config.get("view_min_bytes", 64_000))
@@ -137,6 +136,15 @@ class OptChatEngine(ContextEngine):
         return "optchat"
 
     def on_session_start(self, session_id: str, **kwargs: Any) -> None:
+        if self.root is None:
+            home = kwargs.get("hermes_home")
+            self.root = Path(home) / "optchat" if home is not None else default_root()
+            self._chat_root = self.root
+            config = _load_config(self.root)
+            view_min, view_max, node = self._size_overrides
+            self.view_min_bytes = view_min if view_min is not None else config.get("view_min_bytes", 64_000)
+            self.view_max_bytes = view_max if view_max is not None else config.get("view_max_bytes", 128_000)
+            self.node_bytes = node if node is not None else config.get("node_bytes", 512)
         platform = kwargs.get("platform") or "cli"
         self._writes = platform != "cron"
         if platform == "subagent":
@@ -182,9 +190,17 @@ class OptChatEngine(ContextEngine):
                        budget_tokens: int = 0) -> list[dict[str, Any]] | None:
         if not request_messages:
             return None
-        last_user = next((i for i in range(len(request_messages) - 1, -1, -1)
-                          if request_messages[i].get("role") == "user"), None)
-        if last_user is None:
+        turn_start = None
+        if incoming_message is not None:
+            turn_start = next((i for i, message in enumerate(request_messages)
+                               if message is incoming_message), None)
+            if turn_start is None:
+                turn_start = next((i for i, message in enumerate(request_messages)
+                                   if message == incoming_message), None)
+        if turn_start is None:
+            turn_start = next((i for i in range(len(request_messages) - 1, -1, -1)
+                               if request_messages[i].get("role") == "user"), None)
+        if turn_start is None:
             return None
         system = [copy.deepcopy(message) for message in request_messages
                   if message.get("role") == "system"]
@@ -194,7 +210,7 @@ class OptChatEngine(ContextEngine):
             content = _content_text(system[0].get("content"))
             if SYSTEM_PROMPT not in content:
                 system[0]["content"] = content + "\n\n" + SYSTEM_PROMPT
-        turn = [copy.deepcopy(message) for message in request_messages[last_user:]]
+        turn = [copy.deepcopy(message) for message in request_messages[turn_start:]]
         _, tree, view, compactor = self._open()
         self._turn_system = _content_text(system[0].get("content"))
         compactor.system = self._turn_system

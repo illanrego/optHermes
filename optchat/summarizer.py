@@ -11,6 +11,20 @@ from .compactor import CompactionRequest, Summarizer
 logger = logging.getLogger(__name__)
 
 
+def _ordinary_content(response: object) -> object:
+    """Read the reply's content without consulting reasoning fields."""
+    if isinstance(response, str):
+        return response
+    choices = (response.get("choices") if isinstance(response, dict)
+               else getattr(response, "choices", None))
+    if choices is not None:
+        if not choices:
+            return None
+        first = choices[0]
+        response = first.get("message") if isinstance(first, dict) else getattr(first, "message", None)
+    return response.get("content") if isinstance(response, dict) else getattr(response, "content", None)
+
+
 def make_host_summarizer(*, timeout: float = 300.0) -> Summarizer:
     """Return a request-to-line call using the host's ``auxiliary.optchat`` route.
 
@@ -51,7 +65,10 @@ def make_host_summarizer(*, timeout: float = 300.0) -> Summarizer:
             tools=request.tools or None,
             timeout=float(timeout),
         )
-        line = " ".join(extract_content_or_reasoning(response).splitlines()).strip()
+        # Pass only ordinary content to the host's think-block scrubber. A reply
+        # with reasoning fields alone must not be turned into a tree line.
+        line = " ".join(extract_content_or_reasoning(
+            {"content": _ordinary_content(response)}).splitlines()).strip()
         if not line:
             raise RuntimeError("OptChat auxiliary model returned an empty reply")
         return line

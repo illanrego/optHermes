@@ -7,7 +7,8 @@ from unittest.mock import patch
 
 import pytest
 
-from optchat.compactor import CompactionRequest
+from optchat.compactor import CompactionRequest, Compactor
+from optchat.tree import Tree
 
 
 def request(task="input", *, system="", context="", tools=None):
@@ -19,7 +20,8 @@ def _fake_host(monkeypatch, call, *, provider="example", model="small"):
     agent.__path__ = []
     client = types.ModuleType("agent.auxiliary_client")
     client.call_llm = call
-    client.extract_content_or_reasoning = lambda response: response
+    client.extract_content_or_reasoning = lambda response: (
+        response.get("content") or response.get("reasoning") or "")
     config = types.ModuleType("agent.auxiliary_task_config")
     config._get_auxiliary_task_config = lambda task: {"provider": provider, "model": model}
     monkeypatch.setitem(sys.modules, "agent", agent)
@@ -90,6 +92,31 @@ def test_empty_reply_and_missing_route_fail_closed(monkeypatch):
     _fake_host(monkeypatch, lambda **_kwargs: "unused", model="")
     with pytest.raises(RuntimeError, match="pins a provider but no model"):
         make_host_summarizer()(request())
+
+
+def test_reasoning_only_reply_raises_and_compactor_leaves_node_unbuilt(monkeypatch, tmp_path):
+    _fake_host(monkeypatch, lambda **_kwargs: {
+        "choices": [{"message": {"content": None, "reasoning": "private thoughts"}}]})
+    from optchat.summarizer import make_host_summarizer
+
+    summarize = make_host_summarizer()
+    with pytest.raises(RuntimeError, match="empty reply"):
+        summarize(request())
+
+    tree = Tree(tmp_path, node_bytes=8)
+    compactor = Compactor(tree, summarize, node_bytes=8)
+    compactor.seed(0, "a source that needs a summary")
+    with pytest.warns(RuntimeWarning, match="empty reply"):
+        assert compactor.run_pending() == 0
+    assert tree.get(0, 0) is None
+
+
+def test_content_wins_over_reasoning(monkeypatch):
+    _fake_host(monkeypatch, lambda **_kwargs: {
+        "choices": [{"message": {"content": "ordinary\nline", "reasoning": "private thoughts"}}]})
+    from optchat.summarizer import make_host_summarizer
+
+    assert make_host_summarizer()(request()) == "ordinary line"
 
 
 def test_auto_provider_inherits_the_main_model(monkeypatch):
