@@ -622,3 +622,46 @@ Every registration/startup failure path logs one clear error line naming the los
 ("OptChat is not active: ... the host will ... compress it lossily ..."); `on_session_start` logs
 once per engine and re-raises. The host's silent fallback to its built-in compressor is unchanged -
 it is an upstream ask (docs/FINDINGS.md).
+
+---
+
+# Revision 11 - the three host seams are wired (2026-10-11)
+
+WP9. The seams built in the seam worktree (`feat/context-engine-seams`, commit `cf1743d63a`) are
+now used. Two interfaces change; one refusal is deliberately not taken.
+
+## The turn's tools reach the compactor on every route
+
+`select_context` accepts `tools=` - the host's deep copy of the request's outgoing schemas, `None`
+when unavailable - and captures it with the same rule `cache_plan` uses (one helper,
+`_capture_turn_tools`: a deep copy into `_turn_tools`, `_has_turn_tools` latched, and the
+compactor's tools updated at once). On a route where no cache-plan hook fires this is the only
+carrier, so a compaction now sends the same tools a turn sends, mark-based route or not. An
+explicitly empty list is a capture, exactly as in `cache_plan`. `None` means unavailable and
+changes nothing: the navigation schemas remain the fallback and the existing one-time warning is
+unchanged.
+
+## The engine does not refuse requests (`ContextSelectionBlocked` stays unused)
+
+The seam lets an engine refuse a request so the host re-assembles once; the engine deliberately
+never raises it. `select_context` already runs `compactor.settle(...)` before rendering - free
+work only, `model_calls=False` - which is the most admission possible without starting a model
+call on the turn path (a summarizer call already in flight cannot be interrupted by the
+deadline). Refusing would make the host re-assemble once and then send its own original request -
+the full transcript plus Hermes' own compression - which is strictly worse than serving a view
+that still carries placeholders: the design's economics (a stable prefix a compaction can read)
+survive placeholders, and they do not survive a transcript swap. A turn served with an unsettled
+view logs one debug line, so the condition is visible when it happens and silent when it does not.
+
+## The log is written as the turn unfolds (`on_message`)
+
+`on_message` ingests each appended message immediately, with the same classification
+`on_turn_complete` uses - one shared walk (`_ingest_rows`), so a row's kind never depends on which
+hook ingested it. Ingestion starts at the checkpoint boundary, so rows the host appended without a
+notification (the turn's user row, synthetic nudges) are ingested too, and the appended row is
+located by equality against the clone the host hands over, never assumed to be the last row.
+`on_turn_complete` stays the reconciler: it runs the same walk from the same boundary, so rows
+already ingested are a no-op. The checkpoint still advances once per row, after every record of
+that row is durable, so a restart resumes at the boundary and a crash mid-turn cannot skip a row.
+A delegate result is resolved once (at ingestion or at selection, whichever comes first) and its
+name is registered from that resolution.

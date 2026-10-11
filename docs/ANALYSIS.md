@@ -34,9 +34,10 @@ same question (`~/.hermes/cache/scratch/brief-ANALYSIS-goals.md`). The yardstick
 
 ### (b) Gaps not built yet
 
-- **WP9**: the three seams exist in the host (`cf1743d63a`) but nothing in the engine uses them yet.
-  Until then: a compaction on a no-mark route still sends the wrong tools; admission is still
-  best-effort; logging is still at the turn boundary.
+- Nothing outstanding. WP9 wired the seams: the turn's tools are captured on every route (so a
+  compaction can read a turn's cache entry where no cache-plan hook fires), and the log is written
+  as the turn unfolds through `on_message`, with the turn boundary as the reconciler. The refusal
+  seam is deliberately unused, with the reason recorded.
 
 ### (c) A plugin cannot own these
 
@@ -50,14 +51,16 @@ same question (`~/.hermes/cache/scratch/brief-ANALYSIS-goals.md`). The yardstick
 
 ## 3. Implementation vs design - the sharpest inconsistencies
 
-1. **A compaction is not always "a call like a turn".** On a route with no cache-plan hook the engine
-   never sees the turn's outgoing tools, so the compaction's prefix diverges at the tool block and it
-   cannot read the turn's cache entry. The seam is built; nothing uses it yet (WP9).
-2. **We do not wait for the fold.** The design says a turn waits until every message before it is
-   summarized. We serve the view with placeholders instead. `ContextSelectionBlocked` is built and
-   unused.
-3. **We log at the turn boundary, not as things happen.** The design's log is written per reply, tool
-   call and result. `on_message` is built and unused.
+1. **A compaction is not always "a call like a turn".** FIXED in WP9: the tools now arrive through
+   `select_context` on every route, so a compaction sends what a turn sends. Still unproven on the
+   wire - which is the milestone.
+2. **We do not wait for the fold.** DECIDED, not fixed. Selection settles for free before rendering,
+   which is the most admission possible without starting a model call on the turn path; refusing
+   would make the host send its own transcript plus compression, which is strictly worse. A debug
+   line makes an unsettled view visible when it happens. The law is unmet by choice, with the reason
+   recorded in CONTRACT revision 11.
+3. **We log at the turn boundary, not as things happen.** FIXED in WP9: `on_message` ingests each
+   append, and the turn boundary reconciles rather than duplicating.
 4. **Two stores, one of them unreachable.** The log is the memory; the host's transcript is a second
    copy that the model could reach until we removed `session_search` from the profile's tools. The
    removal is a config fact, not a code guarantee - a profile without that edit silently reopens the
@@ -77,12 +80,13 @@ same question (`~/.hermes/cache/scratch/brief-ANALYSIS-goals.md`). The yardstick
 
 ## 5. What to fix first
 
-1. **WP9** - wire the three seams. It closes inconsistencies 1, 2 and 3 at once, and each has a host
-   hook waiting for it.
-2. **The verification milestone** - measure turn->compaction and compaction->compaction on the real
-   wire. Until then "it is cheaper" is an argument.
-3. **The toolset gate (#16)** - an engine without its tools is worse than no engine: the model gets a
+1. **The verification milestone** - measure turn->compaction and compaction->compaction on the real
+   wire. WP9 is what makes the first one measurable; until it is measured, "it is cheaper" is an
+   argument, not a result.
+2. **The toolset gate (#16)** - an engine without its tools is worse than no engine: the model gets a
    view it cannot open.
+3. **A live run** - WP1-WP9 are verified by tests, not by use. The engine has not been exercised
+   inside a real host since WP4.
 
 ## 6. Blind spots
 

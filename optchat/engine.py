@@ -6,10 +6,20 @@ becomes tool (name and JSON arguments, including any accompanying content);
 delegate_task results become work, and other tool results become echo.
 Thinking fields are never logged.
 
-On a no-mark route, the outgoing tools are the one part of the turn's request
-identity that compaction cannot yet match: the host's cache-policy gates the
-only hook carrying tools. Until a host seam passes tools to ``select_context``,
-the navigation schemas remain the fallback, with a warning once per engine.
+``select_context`` receives the request's outgoing tools (the host seam) and
+captures them exactly as ``cache_plan`` does, so a compaction sends the same
+tool schemas a turn sends on every route, mark-based or not; ``None`` means the
+host has none to give, and the navigation schemas remain the fallback with a
+warning once per engine.
+
+``on_message`` ingests each appended message as the turn unfolds, with the same
+classification ``on_turn_complete`` uses; the ingestion checkpoint keeps the
+turn-boundary pass a reconciler, never a duplicate. The engine deliberately
+does not raise ``ContextSelectionBlocked``: selection settles for free before
+rendering, and refusing would make the host send its own original request -
+full transcript plus Hermes' own compression - which is strictly worse than a
+view that still carries placeholders (CONTRACT.md revision 11). A turn served
+with an unsettled view logs one debug line; a settled one is silent.
 
 The retained request tail starts at the host's ``incoming_message`` when that
 message is present in the request (identity first, then equality). Otherwise it
@@ -67,7 +77,7 @@ from .prompts import SYSTEM_PROMPT
 from .store import Log
 from .text import split_for_kind
 from .tree import Tree
-from .view import View
+from .view import PLACEHOLDER, View
 from . import tools as opt_tools
 
 
@@ -227,9 +237,10 @@ class OptChatEngine(ContextEngine):
         self._warned_ingest_boundary = False
         self._warned_child_conflicts: set[str] = set()
         self._start_failure_logged = False
-        # Delegate results already seen by a selection of the running turn, keyed
-        # by row fingerprint: ``_arrived_rows`` guards against re-resolving a row,
-        # ``_arrived_records`` carries its resolution to ingestion.
+        # Delegate results already resolved, keyed by row fingerprint - by a
+        # selection of the running turn or by ingestion itself: ``_arrived_rows``
+        # guards against resolving a row twice, ``_arrived_records`` carries a
+        # selection's resolution to ingestion (and is popped there).
         self._arrived_rows: set[str] = set()
         self._arrived_records: dict[str, list[tuple[str, str, str | None]]] = {}
         # Cron reads only; a child writes to its own chat after session start.
@@ -419,7 +430,19 @@ class OptChatEngine(ContextEngine):
     def select_context(self, request_messages: list[dict[str, Any]], *,
                        conversation_messages: list[dict[str, Any]] | None = None,
                        incoming_message: dict[str, Any] | None = None,
-                       budget_tokens: int = 0) -> list[dict[str, Any]] | None:
+                       budget_tokens: int = 0,
+                       tools: list[dict[str, Any]] | None = None) -> list[dict[str, Any]] | None:
+        """Select the request's context for this call (see CONTRACT.md).
+
+        ``tools`` is the request's outgoing schemas as the host hands them over
+        (a deep copy; ``None`` when unavailable). They are captured exactly as
+        ``cache_plan`` captures them, so a compaction sends the same tools a
+        turn sends on any route - including routes where no cache-plan hook
+        fires. Nothing is invented for ``None``: the navigation fallback and its
+        one-time warning stay in force.
+        """
+        if tools is not None:
+            self._capture_turn_tools(tools)
         if not request_messages:
             return None
         turn_start = None
@@ -477,6 +500,15 @@ class OptChatEngine(ContextEngine):
         except Exception:
             logger.exception("OptChat settle failed; serving the current view")
         logger.debug("OptChat settle built %d nodes; view settled: %s", built, view.settled())
+        served = self._master_view or view
+        if not served.settled():
+            # The honest gap: a long message's node still needs a model, and the
+            # turn path must never start one. Visible when it happens, silent when not.
+            logger.debug(
+                "OptChat serves an unsettled view for this turn: %d line(s) still hold "
+                "placeholders; a long message awaits its background summary",
+                sum(1 for line in served.lines() if line.text == PLACEHOLDER),
+            )
         # The runtime block travels where the design puts per-turn state: after the
         # view and before this turn's messages (the host merges it into the turn's
         # first user row, exactly as it delivers its own per-turn notes).
@@ -762,6 +794,99 @@ class OptChatEngine(ContextEngine):
             work.append((name, f"[{name}] {body}", key))
         return work
 
+    def _ingest_rows(self, messages: list[dict[str, Any]], start: int, end: int) -> None:
+        """Append the log records for host rows ``[start, end)``.
+
+        The classification is the one ``on_turn_complete`` has always used (call
+        ids are tracked while walking, so a tool result is attributed to the call
+        it answers); ``on_message`` shares it, so a row's kind never depends on
+        which hook ingested it. The checkpoint advances once per row, after every
+        record of that row is durable, so a crash re-ingests at most the row it
+        was on - never a skipped or duplicated row.
+        """
+        log, tree, view, compactor = self._open()
+        chat_root = self._chat_root or self.root
+        assert chat_root is not None
+        recent = [_row_fingerprint(messages[row])
+                  for row in range(max(0, start - CHECKPOINT_ROWS), start)]
+        child_index = self._child_index() if self._chat_root == self.root else {}
+        known_keys = set(child_index.values())
+        tool_names: dict[str, str] = {}
+        for row, message in enumerate(messages):
+            if row >= end:
+                break
+            if message.get("role") == "assistant":
+                for call in message.get("tool_calls") or []:
+                    function = call.get("function") if isinstance(call, dict) else None
+                    if (isinstance(call.get("id"), str) and isinstance(function, dict)
+                            and isinstance(function.get("name"), str)):
+                        tool_names[call["id"]] = function["name"]
+            call_id = message.get("tool_call_id") if message.get("role") == "tool" else None
+            tool_name = tool_names.pop(call_id, None) if isinstance(call_id, str) else None
+            if row < start:
+                continue
+            if tool_name == "delegate_task" and self._chat_root == self.root:
+                fingerprint = _row_fingerprint(message)
+                arrived = self._arrived_records.pop(fingerprint, None)
+                if arrived is not None:
+                    # A selection of this running turn already resolved the row;
+                    # reuse it so the logged [Name] matches the registered mapping.
+                    records = [("work", record, name, key) for name, record, key in arrived]
+                    for _name, _record, key in arrived:
+                        if key is not None:
+                            known_keys.add(key)
+                else:
+                    records = [("work", record, name, key) for name, record, key in
+                               self._delegate_work(_content_text(message.get("content")), known_keys)]
+                # Ingestion resolved this row: a later selection must not resolve
+                # it again (the name is registered below, from this resolution).
+                self._arrived_rows.add(fingerprint)
+            else:
+                records = [(kind, text, None, None) for kind, text in
+                           self._records(message, self.node_bytes, tool_name)]
+            for record_index, (kind, text, name, key) in enumerate(records):
+                index = log.append(kind, text)
+                if record_index == 0:
+                    archive_media(chat_root, index, message.get("content"))
+                compactor.seed(index, text, kind)
+                view.add_root(index)
+                if name is not None and key is not None:
+                    self._register_child(name, key)
+            # Advance only once every record of this row is durable, so a crash
+            # mid-row re-ingests that row instead of skipping its other records.
+            recent.append(_row_fingerprint(message))
+            self._save_checkpoint(row + 1, recent)
+
+    def on_message(self, messages: list[dict[str, Any]], message: dict[str, Any],
+                   **kwargs: Any) -> None:
+        """Ingest the message the host just appended, as the turn unfolds.
+
+        Fires after each host append (assistant replies and tool results), so the
+        log is written during the turn instead of only at its boundary. Ingestion
+        starts at the checkpoint boundary, so rows the host appended without a
+        notification (the turn's user row, synthetic nudges) are ingested too;
+        the appended row itself is located by equality against the structural
+        clone the host hands over, never assumed to be the last row. Fail-open:
+        anything unexpected leaves the turn untouched, and ``on_turn_complete``
+        reconciles at the boundary.
+        """
+        self._open()
+        if not self._writes:
+            return
+        checkpoint = self._load_checkpoint()
+        start = self._resume_row(messages, checkpoint)
+        if start is None:
+            # The recorded rows are gone (a compression rewrote them). Ingest
+            # nothing here; the turn-complete reconciler warns once instead of
+            # guessing a boundary that could duplicate history.
+            return
+        row = next((index for index in range(len(messages) - 1, -1, -1)
+                    if messages[index] == message), None)
+        if row is None or start >= row + 1:
+            # Not found, or already ingested (a duplicate notification).
+            return
+        self._ingest_rows(messages, start, row + 1)
+
     def on_turn_complete(self, messages: list[dict[str, Any]], usage: dict[str, Any] | None = None,
                          **kwargs: Any) -> None:
         # _open() first: an engine whose session never started learns its context there
@@ -783,49 +908,9 @@ class OptChatEngine(ContextEngine):
                     "this turn rather than guessing a boundary that could duplicate history.",
                     RuntimeWarning, stacklevel=2)
             return
-        recent = [_row_fingerprint(messages[row])
-                  for row in range(max(0, start - CHECKPOINT_ROWS), start)]
-        child_index = self._child_index() if self._chat_root == self.root else {}
-        known_keys = set(child_index.values())
-        tool_names: dict[str, str] = {}
-        for row, message in enumerate(messages):
-            if message.get("role") == "assistant":
-                for call in message.get("tool_calls") or []:
-                    function = call.get("function") if isinstance(call, dict) else None
-                    if (isinstance(call.get("id"), str) and isinstance(function, dict)
-                            and isinstance(function.get("name"), str)):
-                        tool_names[call["id"]] = function["name"]
-            call_id = message.get("tool_call_id") if message.get("role") == "tool" else None
-            tool_name = tool_names.pop(call_id, None) if isinstance(call_id, str) else None
-            if row < start:
-                continue
-            if tool_name == "delegate_task" and self._chat_root == self.root:
-                arrived = self._arrived_records.pop(_row_fingerprint(message), None)
-                if arrived is not None:
-                    # A selection of this running turn already resolved the row;
-                    # reuse it so the logged [Name] matches the registered mapping.
-                    records = [("work", record, name, key) for name, record, key in arrived]
-                    for _name, _record, key in arrived:
-                        if key is not None:
-                            known_keys.add(key)
-                else:
-                    records = [("work", record, name, key) for name, record, key in
-                               self._delegate_work(_content_text(message.get("content")), known_keys)]
-            else:
-                records = [(kind, text, None, None) for kind, text in
-                           self._records(message, self.node_bytes, tool_name)]
-            for record_index, (kind, text, name, key) in enumerate(records):
-                index = log.append(kind, text)
-                if record_index == 0:
-                    archive_media(self._chat_root, index, message.get("content"))
-                compactor.seed(index, text, kind)
-                view.add_root(index)
-                if name is not None and key is not None:
-                    self._register_child(name, key)
-            # Advance only once every record of this row is durable, so a crash
-            # mid-row re-ingests that row instead of skipping its other records.
-            recent.append(_row_fingerprint(message))
-            self._save_checkpoint(row + 1, recent)
+        # The reconciler: rows already ingested through on_message are before the
+        # checkpoint boundary, so this walk adds only what it has not seen.
+        self._ingest_rows(messages, start, len(messages))
         # One save per turn, not per record: the log append is already fsync'd per
         # record, and the tree and view are derived state.
         tree.save()
@@ -877,12 +962,22 @@ class OptChatEngine(ContextEngine):
                 setattr(clone, field, getattr(self, field))
         return clone
 
-    def _plan_cache(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]):
-        """Shared seam/shim entry, called only after the host's explicit plan."""
+    def _capture_turn_tools(self, tools: list[dict[str, Any]]) -> None:
+        """Record the request's outgoing tools for compactions.
+
+        The single capture rule, shared by ``cache_plan`` (the mark-based route)
+        and ``select_context`` (every route, including the no-mark one): a deep
+        copy of the host's schemas, ``_has_turn_tools`` latched, and the
+        compactor updated at once so the next compaction reads the turn's tools.
+        """
         self._turn_tools = copy.deepcopy(tools)
         self._has_turn_tools = True
         if self.compactor is not None:
             self.compactor.tools = self._turn_tools
+
+    def _plan_cache(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]):
+        """Shared seam/shim entry, called only after the host's explicit plan."""
+        self._capture_turn_tools(tools)
         return plan_view_cache(messages, tools)
 
 

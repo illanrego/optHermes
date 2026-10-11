@@ -868,3 +868,204 @@ def test_selection_requires_the_host_end_marker(tmp_path, monkeypatch):
 
     assert selected[0]["content"] == content + "\n\n" + SYSTEM_PROMPT
     assert len(selected) == 3  # nothing was lifted without the terminator
+
+
+@pytest.mark.parametrize("capture_before_start", [False, True])
+@pytest.mark.parametrize("tools", [[], [
+    {"type": "function", "function": {"name": "host_search",
+     "parameters": {"type": "object", "properties": {"query": {"type": "string"}}}}},
+]])
+def test_selection_captures_turn_tools_for_compactions(tmp_path, capture_before_start, tools):
+    """On a route where cache_plan never fires, the tools select_context receives
+    are the only carrier; a compaction must send exactly the turn's schemas."""
+    summarizer = FakeSummarizer()
+    engine = OptChatEngine(tmp_path, summarize=summarizer, node_bytes=16)
+    tools = copy.deepcopy(tools)
+    expected = copy.deepcopy(tools)
+    if not capture_before_start:
+        engine.on_session_start("session")
+    engine.select_context([{"role": "user", "content": "task"}], tools=tools)
+    assert engine.compactor.tools == expected  # Updated before any compaction.
+    tools.append({"function": {"name": "later_host_mutation"}})
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        engine.on_turn_complete([{"role": "tool", "content": "long result " * 5}])
+    assert not caught  # The capture silences the missing-tools warning.
+    assert summarizer.prompts
+    assert all(request.tools == expected for request in summarizer.prompts)
+    engine.log.close()
+
+
+def test_selection_without_tools_keeps_fallback_and_warns_once(tmp_path):
+    """``tools=None`` means the host has none to give: the navigation fallback
+    and its one-time warning stay, and nothing is invented."""
+    for name in ("first", "second"):
+        summarizer = FakeSummarizer()
+        engine = OptChatEngine(tmp_path / name, summarize=summarizer, node_bytes=16)
+        messages = [{"role": "tool", "content": "long result " * 5}]
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            engine.select_context(messages, tools=None)
+            engine.on_turn_complete(messages)
+        assert len(caught) == 1
+        assert caught[0].category is RuntimeWarning
+        assert "the only hook that carries tools" in str(caught[0].message)
+        assert summarizer.prompts
+        assert all(request.tools == engine.get_tool_schemas() for request in summarizer.prompts)
+        engine.log.close()
+
+
+def test_unsettled_view_logs_at_debug_and_still_serves_the_view(tmp_path, caplog):
+    """A turn served with an unsettled view says so once, at debug, and still
+    returns the view; a settled turn is silent."""
+    summarizer = FakeSummarizer()
+
+    def offline(request):
+        summarizer(request)
+        raise RuntimeError("offline")
+
+    engine = OptChatEngine(tmp_path / "unsettled", node_bytes=32, summarize=offline)
+    with pytest.warns(RuntimeWarning):
+        engine.on_turn_complete([{"role": "tool", "content": "x" * 80} for _ in range(9)])
+    assert not engine.view.settled()
+    before = len(summarizer.prompts)
+
+    with caplog.at_level(logging.DEBUG, logger="optchat.engine"):
+        selected = engine.select_context([{"role": "user", "content": "next"}])
+
+    assert len(summarizer.prompts) == before  # the turn path never starts a model call
+    assert "(not summarized yet: zoom it)" in selected[1]["content"]
+    unsettled = [record for record in caplog.records if "unsettled view" in record.getMessage()]
+    assert unsettled and all(record.levelno == logging.DEBUG for record in unsettled)
+
+    settled = OptChatEngine(tmp_path / "settled", summarize=FakeSummarizer())
+    settled.on_turn_complete([{"role": "user", "content": "short"}])
+    assert settled.view.settled()
+    caplog.clear()
+    with caplog.at_level(logging.DEBUG, logger="optchat.engine"):
+        settled.select_context([{"role": "user", "content": "next"}])
+    assert not [record for record in caplog.records if "unsettled view" in record.getMessage()]
+    engine.log.close()
+    settled.log.close()
+
+
+def test_on_message_ingests_each_append_exactly_once(tmp_path):
+    """The log is written as the turn unfolds, with on_turn_complete's own
+    classification; the turn-boundary reconciler then adds nothing, and a
+    duplicate notification is a no-op too."""
+    engine = OptChatEngine(tmp_path, summarize=FakeSummarizer())
+    engine.on_session_start("session")
+    messages = [{"role": "user", "content": "task"}]
+    call = {"role": "assistant", "content": None, "tool_calls": [
+        {"id": "call-1", "function": {"name": "lookup", "arguments": "{}"}}]}
+    messages.append(call)
+    engine.on_message(messages, copy.deepcopy(call))
+    result = {"role": "tool", "tool_call_id": "call-1", "content": "result"}
+    messages.append(result)
+    engine.on_message(messages, copy.deepcopy(result))
+    reply = {"role": "assistant", "content": "done"}
+    messages.append(reply)
+    engine.on_message(messages, copy.deepcopy(reply))
+
+    # The user row was appended without a notification; the first on_message
+    # ingested it from the checkpoint boundary, not just the appended row.
+    assert [(record.kind, record.text) for record in engine.log.range(0, engine.log.count() - 1)] == [
+        ("user", "task"),
+        ("tool", '{"name": "lookup", "arguments": {}}'),
+        ("echo", "result"),
+        ("unii", "done")]
+
+    count = engine.log.count()
+    engine.on_message(messages, copy.deepcopy(reply))  # duplicate notification
+    assert engine.log.count() == count
+    engine.on_turn_complete(messages)  # the reconciler adds nothing
+    assert engine.log.count() == count
+    engine.log.close()
+
+
+def test_on_message_ingests_a_row_appended_without_notification(tmp_path):
+    """A synthetic row the host appends between notifications is ingested from
+    the checkpoint boundary when the next notification arrives."""
+    engine = OptChatEngine(tmp_path, summarize=FakeSummarizer())
+    engine.on_session_start("session")
+    messages = [{"role": "user", "content": "task"},
+                {"role": "assistant", "content": "partial"}]
+    engine.on_message(messages, copy.deepcopy(messages[-1]))
+    messages.append({"role": "user", "content": "[System: continue]"})  # no notification
+    messages.append({"role": "assistant", "content": "final"})
+    engine.on_message(messages, copy.deepcopy(messages[-1]))
+
+    assert [record.text for record in engine.log.range(0, engine.log.count() - 1)] == [
+        "task", "partial", "[System: continue]", "final"]
+    engine.log.close()
+
+
+def test_on_message_classifies_a_delegate_result_like_turn_complete(tmp_path):
+    """The same classification, mid-turn: a delegate result becomes one work
+    record and its name is registered before the turn ends."""
+    master = OptChatEngine(tmp_path, summarize=FakeSummarizer())
+    master.on_session_start("master", platform="cli")
+    child = master.clone_for_agent()
+    child.on_session_start("child-session", platform="subagent")
+    child.on_turn_complete([{"role": "user", "content": "find the answer"}])
+
+    messages = [{"role": "user", "content": "task"},
+                {"role": "assistant", "content": None, "tool_calls": [
+                    {"id": "delegate-1", "function": {"name": "delegate_task", "arguments": "{}"}}]}]
+    master.on_message(messages, copy.deepcopy(messages[-1]))
+    result = {"role": "tool", "tool_call_id": "delegate-1", "content": json.dumps(
+        {"results": [{"task_index": 0, "name": "Researcher",
+                      "child_session_id": "child-session", "summary": "found it"}]})}
+    messages.append(result)
+    master.on_message(messages, copy.deepcopy(result))
+
+    assert [(record.kind, record.text) for record in master.log.range(0, master.log.count() - 1)] == [
+        ("user", "task"),
+        ("tool", '{"name": "delegate_task", "arguments": {}}'),
+        ("work", "[Researcher] " + result["content"])]
+    assert json.loads((tmp_path / "agents" / "index.json").read_text()) == {
+        "Researcher": "child-session"}
+    assert "find the answer" in json.loads(master.handle_tool_call(
+        "optchat_zoom", {"id": "Researcher"}))["chat"]
+    child.log.close()
+    master.log.close()
+
+
+def test_on_message_finds_the_appended_row_wherever_it_sits(tmp_path):
+    """The notified row is located in the list it is handed - never assumed to be
+    the last row - so a row appended after it waits for its own notification or
+    for the turn-boundary reconciler."""
+    engine = OptChatEngine(tmp_path, summarize=FakeSummarizer())
+    engine.on_session_start("session")
+    messages = [{"role": "user", "content": "task"},
+                {"role": "assistant", "content": "answered"},
+                {"role": "user", "content": "appended after, not notified"}]
+    engine.on_message(messages, copy.deepcopy(messages[1]))  # the assistant row, not the tail
+
+    assert [record.text for record in engine.log.range(0, engine.log.count() - 1)] == [
+        "task", "answered"]
+    engine.on_turn_complete(messages)
+    assert [record.text for record in engine.log.range(0, engine.log.count() - 1)] == [
+        "task", "answered", "appended after, not notified"]
+    engine.log.close()
+
+
+def test_restart_resumes_after_on_message_ingestion_without_gaps(tmp_path):
+    """A restart after on_message-only ingestion resumes at the boundary; a row
+    appended but never notified is not skipped, and a re-send duplicates nothing."""
+    messages = [{"role": "user", "content": "one"}, {"role": "assistant", "content": "two"}]
+    engine = OptChatEngine(tmp_path, summarize=FakeSummarizer())
+    engine.on_session_start("session")
+    engine.on_message(messages, copy.deepcopy(messages[-1]))
+    assert [record.text for record in engine.log.range(0, engine.log.count() - 1)] == ["one", "two"]
+    engine.log.close()  # a crash: the turn never reached on_turn_complete
+
+    restarted = OptChatEngine(tmp_path, summarize=FakeSummarizer())
+    restarted.on_session_start("session")
+    tail = {"role": "tool", "content": "appended but never notified"}
+    restarted.on_turn_complete(messages + [tail])
+    assert [record.text for record in restarted.log.range(0, restarted.log.count() - 1)] == [
+        "one", "two", "appended but never notified"]  # the crash tail is not skipped
+    restarted.on_turn_complete(messages + [tail])     # a re-send adds nothing
+    assert restarted.log.count() == 3
+    restarted.log.close()
