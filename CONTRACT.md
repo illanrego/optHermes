@@ -511,3 +511,30 @@ checkpoint advances only after **all** records of a row are durable, so a crash 
 that row instead of skipping its remaining records. When no recorded row can be found - a
 compression rewrote the transcript - the engine ingests nothing and warns once, rather than guessing
 a boundary that could duplicate history.
+
+---
+
+# Structural rules - laws enforced by absence (2026-10-11)
+
+A law that must hold is enforced by **absence**, not by instruction. A prompt line is a preference
+that decays under pressure; a tool that is not in the list cannot be called at all. The prompt's
+"never grep or search memories manually; optchat_zoom is your only allowed mechanism to navigate the
+tree" stays as belt and braces, but nothing depends on it.
+
+Corollary: whenever the engine is enabled in a profile, **audit the tool surface for memory-shaped
+tools** - including any MCP server that stores or reads notes - and remove them rather than
+instructing against them. For the `opthermes-dev` profile this meant deleting two entries from
+`platform_toolsets.cli`:
+
+- `session_search` - a second door to the past: it searches the host transcript, bypasses the fold,
+  and can read raw rows the host's own compression already discarded. That contradicts "the view is
+  your memory, and its latest word on a thing is the truth".
+- `memory` - the built-in memory tool. `memory_enabled` and `user_profile_enabled` are false in this
+  profile, so it could only ever refuse; a dead tool is an invitation plus a wasted schema in the
+  cached prefix.
+
+Known and accepted: `terminal`, `file` and `code_execution` remain, and the log is a plain file
+(`<profile>/optchat/main/*.jsonl`), so an agent with a shell can read or grep its own log. Closing
+that means removing the shell, which would gut the body Hermes is kept for. It is accepted because it
+takes a deliberate act rather than an offered, discoverable tool - and it is recorded here rather
+than left as a footnote.
