@@ -18,7 +18,8 @@ below is **not yet implemented** as of this file.
 | WP2 | #13, #19 (attribution) | kinds and attribution, before more history is built | sol @ high | DONE (53f2c2b) |
 | WP3 | #2, #3, #4 | compaction request identity and routing (cache) | astra @ high | DONE (39d5dfb) |
 | WP4 | #5, #8 | maintained views, scheduling, admission (cache) | astra @ high | DONE (07865b0) |
-| WP5 | #1, #7 | provider-aware cache planning (cache) | astra @ high | RUNNING |
+| WP5 | #1, #7 | provider-aware cache planning (cache) | astra @ high | DONE (e103aa2) |
+| WP5b | (WP5 follow-up) | group the view's cache blocks 4 lines at a time | sol @ high | RUNNING |
 | WP6 | #10, #11, #12, tree tail | ingestion identity and recovery | astra @ high | TODO |
 | WP7 | #14, #15 | child identity and navigation | sol @ high | TODO |
 | WP8 | #6, #17, #20 | prompt volatility, media envelope, host fallback | sol @ high | TODO |
