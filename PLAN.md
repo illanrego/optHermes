@@ -271,6 +271,13 @@ should be injected because the engine is active, not because a toolset entry sur
 resolution. It is the same family as the cache seam (the engine needs first-class
 reachability) and belongs in the conversation around the PR.
 
+**Second host-side gap: a delegate result carries no child identity.** A completed
+`delegate_task` result entry has `task_index` and `summary` but no child session id
+(`tools/delegate_tool_child_run.py`), so a parent can match a report to a child's log only when
+exactly one child chat is unclaimed. With concurrent children the mapping is ambiguous.
+`zoom("Name")` itself is implemented and correct; what is missing is the host handing the parent
+the child's session id in each completed result entry, including failures and detached results.
+
 ## Open questions
 
 - ~~Does the host's sanitizer or cache-control pass alter a replaced list in a way the
