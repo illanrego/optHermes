@@ -14,8 +14,8 @@ below is **not yet implemented** as of this file.
 
 | WP | findings | subject | model | status |
 |---|---|---|---|---|
-| WP1 | #9, reasoning-summary, #18 | turn boundary, a reasoning-only summary, the host home | sol @ high | TODO |
-| WP2 | #13, #19 (attribution) | kinds and attribution, before more history is built | sol @ high | TODO |
+| WP1 | #9, reasoning-summary, #18 | turn boundary, a reasoning-only summary, the host home | sol @ high | DONE (9e3efed) |
+| WP2 | #13, #19 (attribution) | kinds and attribution, before more history is built | sol @ high | RUNNING |
 | WP3 | #2, #3, #4 | compaction request identity and routing (cache) | astra @ high | TODO |
 | WP4 | #5, #8 | maintained views, scheduling, admission (cache) | astra @ high | TODO |
 | WP5 | #1, #7 | provider-aware cache planning (cache) | astra @ high | TODO |
