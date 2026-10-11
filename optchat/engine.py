@@ -296,7 +296,7 @@ class OptChatEngine(ContextEngine):
             if self._master_view is None and self._chat_root == self.root:
                 self._master_view = self.view
                 if self._master_view is None and (self.root / "view.json").is_file():
-                    self._master_view = View(Tree(self.root, self.node_bytes),
+                    self._master_view = View(Tree(self.root, self.node_bytes, read_only=True),
                                              self.view_min_bytes, self.view_max_bytes)
             if self._master_log is None and self._chat_root == self.root and self.log is not None:
                 self._master_log = self.log
@@ -311,7 +311,8 @@ class OptChatEngine(ContextEngine):
         self.log = Log(self._chat_root)
         try:
             self.tree = Tree(self._chat_root, self.node_bytes)
-            self.view = View(self.tree, self.view_min_bytes, self.view_max_bytes)
+            self.view = View(self.tree, self.view_min_bytes, self.view_max_bytes,
+                             records=self.log.count())
             self.compactor = Compactor(self.tree, self.summarize or _missing_summarizer,
                                        node_bytes=self.node_bytes, view=self.view)
             if not self._has_turn_tools:
@@ -331,25 +332,32 @@ class OptChatEngine(ContextEngine):
         is in the log, so a long source is never stranded in memory - and the view
         must cover every record. The view is extended, never rebuilt: a rebuilt view
         renders differently and kills every cache entry (spec section 3).
+
+        Coverage is reconciled independently of root construction: a record whose
+        node was already saved (the tree save succeeded, the view save did not)
+        still grows the view, or the next append fails on the id it expects. A
+        refused id (a line that parses but does not validate) keeps its position
+        in the id space and is covered the same way.
         """
         log, tree, view, compactor = self.log, self.tree, self.view, self.compactor
         end = view._end()
         recovered = 0
+        extended = False
         for i in range(log.count()):
-            if tree.get(0, i) is not None:
-                continue
             record = log.get(i)
-            if record is None:
-                continue
-            compactor.seed(i, record.text, record.kind)
-            recovered += 1
-            if i == end:
+            if (record is not None and tree.get(0, i) is None
+                    and not tree.refused(0, i)):
+                compactor.seed(i, record.text, record.kind)
+                recovered += 1
+            if i >= end:
                 view.add_root(i)
+                extended = True
                 end += 1
         if recovered:
             # Free work only: starting a session must never wait on a model call.
             compactor.run_pending(limit=8, model_calls=False)
             tree.save()
+        if recovered or extended:
             view.save()
 
     def _checkpoint_path(self) -> Path:
@@ -558,7 +566,7 @@ class OptChatEngine(ContextEngine):
             self._master_log = Log(self.root, read_only=True)
         if self._master_tree is None:
             self._master_tree = (self._master_view.tree if self._master_view is not None
-                                 else Tree(self.root, self.node_bytes))
+                                 else Tree(self.root, self.node_bytes, read_only=True))
         return self._master_log, self._master_tree, self._master_view
 
     def _child_scope(self, scope: str) -> tuple[Log, Tree] | str:
@@ -575,7 +583,8 @@ class OptChatEngine(ContextEngine):
         if not (child_root / "view.json").is_file():
             return json.dumps({"error": f"scope {scope!r} has no chat"})
         try:
-            return Log(child_root, read_only=True), Tree(child_root, self.node_bytes)
+            return Log(child_root, read_only=True), Tree(child_root, self.node_bytes,
+                                                         read_only=True)
         except (OSError, ValueError) as exc:
             return json.dumps({"error": f"scope {scope!r} cannot be read: {exc}"})
 

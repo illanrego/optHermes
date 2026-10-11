@@ -665,3 +665,51 @@ already ingested are a no-op. The checkpoint still advances once per row, after 
 that row is durable, so a restart resumes at the boundary and a crash mid-turn cannot skip a row.
 A delegate result is resolved once (at ingestion or at selection, whichever comes first) and its
 name is registered from that resolution.
+
+---
+
+# Revision 12 - refusal, non-writing foreign reads, and explicit view recovery (2026-10-11)
+
+WP10 (PLAN-next Order 1). Four behaviours change: the log and the tree refuse semantic
+corruption loudly, foreign readers stop writing, and a missing view state is an explicit
+outcome instead of a silent rebuild.
+
+## Refused ids and coordinates
+
+A log record or tree node that parses but does not validate is refused with one
+`RuntimeWarning` naming the file, byte offset and reason - never a silent skip.
+
+- `Log` keeps the refused id in its index: `count()` counts id positions, `get` returns
+  `None` for a refused id, `range` may contain `None`, and `append` never reuses the id.
+  The gap rule still applies to ids never seen; a refused id is a known position, not a
+  gap.
+- `Tree` records a refused coordinate: `put` raises for it (it is never rewritten), and
+  `Tree.refused(l, i)` reports it. A valid node whose saved children are missing is kept
+  with a warning - its line was written, so it is not treated as absent - and its
+  coordinate is never rewritten either.
+
+## Non-writing foreign reads
+
+`Tree(root, node_bytes, read_only=False)` mirrors `Log`'s read handle: its loader uses
+`read_jsonl(..., seal=False)` (no tail sealing), and `put`/`save` raise. Every path that
+reads a chat it does not own uses it - scoped integer navigation, string-name zoom, and a
+child reading its master (at capture and at navigation). The owning chat keeps sealing.
+`View.save` refuses to write through a read-only tree.
+
+## Recovery coverage
+
+`OptChatEngine._recover` extends the view to cover every id position at or beyond its end
+whether or not the record's level-0 node already exists (the tree save may have succeeded
+while the view save did not), and a refused id occupies its position, so the next append
+lands on the id it expects.
+
+## Missing view state
+
+`View.load` never treats a missing `view.json` as a normal load. A chat with no records
+builds the empty view silently. A chat that has records - or saved tree nodes, when the
+caller cannot know the record count - warns that the view state is lost (and with it this
+chat's cache entries), rebuilds the closest available view from the tree's saved nodes -
+never from the log - and records `"recovered": true` in `view.json` so a later load can
+see that the recovery happened. `View(tree, min_bytes, max_bytes, records=...)` takes the
+owner's record count; the engine passes `log.count()`, and a foreign read passes nothing.
+The version-2 object gains that boolean.

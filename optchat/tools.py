@@ -57,7 +57,7 @@ def zoom(log: Log, tree: Tree, view: View | None, id: int | str, n: int = 1,
         if not (child_root / "view.json").is_file():
             return _error("subagent chat does not exist")
         try:
-            child_view = View(Tree(child_root))
+            child_view = View(Tree(child_root, read_only=True))
             return json.dumps({"name": id, "scope": id, "chat": child_view.render()},
                               ensure_ascii=False)
         except (OSError, ValueError, TypeError):

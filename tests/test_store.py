@@ -1,4 +1,5 @@
 import json
+import re
 from datetime import datetime, timezone
 from unittest.mock import patch
 
@@ -143,3 +144,43 @@ def test_mid_file_corruption_is_loud(tmp_path):
 
     with pytest.raises(ValueError, match="Corrupt JSONL record"):
         Log(tmp_path)
+
+
+def test_parseable_invalid_records_are_loud_and_never_reused(tmp_path):
+    with Log(tmp_path) as log:
+        log.append("user", "first")
+        log.append("unii", "second")
+        date = log.get(0).date
+        path = tmp_path / "main" / (date[:10] + ".jsonl")
+
+    # Valid JSON, invalid schema and size: silently skipping these would leave
+    # the ids contiguous and let the next append reuse 2 and 3.
+    bad_kind = json.dumps({"id": 2, "kind": "thought", "text": "refused",
+                           "size": 7, "date": date})
+    bad_size = json.dumps({"id": 3, "kind": "note", "text": "also refused",
+                           "size": 999, "date": date})
+    with path.open("ab") as stream:
+        stream.write((bad_kind + "\n" + bad_size + "\n").encode("utf-8"))
+
+    with pytest.warns(RuntimeWarning) as caught:
+        log = Log(tmp_path)
+    messages = [str(item.message) for item in caught]
+    assert any(re.search(rf"{re.escape(str(path))}:\d+ is refused: unknown record kind",
+                         message) for message in messages)
+    assert any(re.search(rf"{re.escape(str(path))}:\d+ is refused: record size does not match",
+                         message) for message in messages)
+
+    assert log.count() == 4                  # the refused ids keep their positions
+    assert log.get(2) is None
+    assert log.get(3) is None
+    assert log.append("note", "after") == 4  # the refused ids are never reused
+    assert log.get(4).text == "after"
+    assert [record.text if record else None for record in log.range(0, 4)] == [
+        "first", "second", None, None, "after"]
+    log.close()
+
+    with Log(tmp_path) as reopened:
+        assert reopened.count() == 5
+        assert [record.text for record in reopened.range(0, 1)] == ["first", "second"]
+        assert reopened.get(2) is None
+        assert reopened.get(4).text == "after"

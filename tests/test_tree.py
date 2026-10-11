@@ -1,4 +1,5 @@
 import json
+import re
 
 import pytest
 
@@ -115,3 +116,72 @@ def test_identical_duplicate_node_is_tolerated(tmp_path):
         stream.write(json.dumps({"l": 0, "i": 0, "text": "alpha", "size": 5}).encode() + b"\n")
 
     assert Tree(tmp_path).get(0, 0).text == "alpha"
+
+
+def test_parseable_invalid_node_is_loud_and_its_coordinate_is_never_reused(tmp_path):
+    tree = Tree(tmp_path)
+    tree.put(0, 0, "alpha")
+    tree.save()
+    path = next((tmp_path / "tree").glob("*.jsonl"))
+
+    bad = json.dumps({"l": 0, "i": 1, "text": "beta", "size": 999}) + "\n"
+    with path.open("ab") as stream:
+        stream.write(bad.encode("utf-8"))
+
+    with pytest.warns(RuntimeWarning) as caught:
+        restored = Tree(tmp_path)
+    assert any(re.search(rf"{re.escape(str(path))}:\d+ is refused: node size",
+                         str(item.message)) for item in caught)
+    assert restored.get(0, 1) is None
+    assert restored.refused(0, 1)
+    with pytest.raises(ValueError, match="refused"):
+        restored.put(0, 1, "rebuilt")
+
+
+def test_node_whose_children_are_missing_is_loud_and_kept(tmp_path):
+    tree = Tree(tmp_path)
+    tree.put(0, 2, "leaf")
+    tree.save()
+    path = next((tmp_path / "tree").glob("*.jsonl"))
+
+    # A written parent whose children are gone from the file: the loader must not
+    # treat the node as if it had never been written.
+    parent = {"l": 1, "i": 0, "text": "kept parent",
+              "size": len("kept parent".encode("utf-8"))}
+    with path.open("ab") as stream:
+        stream.write(json.dumps(parent).encode("utf-8") + b"\n")
+
+    with pytest.warns(RuntimeWarning) as caught:
+        restored = Tree(tmp_path)
+    assert any(re.search(rf"{re.escape(str(path))}:\d+ was already written",
+                         str(item.message)) for item in caught)
+    assert restored.get(1, 0).text == "kept parent"
+    with pytest.raises(ValueError, match="already built"):
+        restored.put(1, 0, "other")
+    # Children arriving later never rewrite the kept line either.
+    restored.put(0, 0, "a")
+    restored.put(0, 1, "b")
+    assert restored.get(1, 0).text == "kept parent"
+
+
+def test_read_only_tree_never_seals_and_the_owner_still_does(tmp_path):
+    tree = Tree(tmp_path)
+    tree.put(0, 0, "alpha")
+    tree.save()
+    path = next((tmp_path / "tree").glob("*.jsonl"))
+    node = {"l": 0, "i": 1, "text": "beta", "size": 4}
+    with path.open("ab") as stream:
+        stream.write(json.dumps(node).encode("utf-8"))
+    torn = path.read_bytes()
+
+    reader = Tree(tmp_path, read_only=True)
+    assert reader.get(0, 1).text == "beta"   # a complete line missing its newline is read
+    assert path.read_bytes() == torn         # but a reader never makes the file whole
+    with pytest.raises(ValueError, match="read-only"):
+        reader.put(0, 2, "gamma")
+    with pytest.raises(ValueError, match="read-only"):
+        reader.save()
+
+    owner = Tree(tmp_path)                   # the owning chat keeps sealing
+    assert owner.get(0, 1).text == "beta"
+    assert path.read_bytes() == torn + b"\n"
