@@ -22,7 +22,7 @@ below is **not yet implemented** as of this file.
 | WP5b | (WP5 follow-up) | group the view's cache blocks 4 lines at a time | sol @ high | DONE (af62f01) |
 | WP6 | #10, #11, #12, tree tail | ingestion identity and recovery | by hand (codex limit) | DONE (acebbcd) |
 | WP7 | #14, #15 | child identity and navigation | sol @ high | DONE (030fc2e) |
-| WP8 | #6, #17, #20 | prompt volatility, media envelope, host fallback | sol @ high | RUNNING |
+| WP8 | #6, #17, #20 | prompt volatility, media envelope, host fallback | sol @ high | DONE (b7c185a) |
 | WP9 | (seam wiring) | use the three host seams: tools for compactions, refusal for admission, per-message for live logging | TODO | TODO |
 
 Order and why: **WP1** first (the turn-boundary bug is the most urgent active-turn defect and
