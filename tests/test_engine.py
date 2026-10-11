@@ -530,3 +530,43 @@ def test_session_start_falls_back_to_default_home(tmp_path, monkeypatch):
 
     assert engine.root == tmp_path / ".hermes" / "optchat"
     assert engine.log.root == engine.root
+
+
+def test_recovery_after_a_log_write_that_never_reached_the_derived_state(tmp_path):
+    engine = OptChatEngine(tmp_path, summarize=FakeSummarizer())
+    engine.on_session_start("session")
+    engine.on_turn_complete([{"role": "user", "content": "first"}])
+    # A record the derived state never saw, as after a crash between the two saves.
+    index = engine.log.append("note", "second")
+    engine.tree.save()
+    engine.view.save()
+    engine.log.close()
+
+    recovered = OptChatEngine(tmp_path, summarize=FakeSummarizer())
+    recovered.on_session_start("session")
+
+    assert index == 1
+    assert recovered.tree.get(0, index) is not None
+    assert recovered.view._end() == 2
+    assert "note: second" in recovered.view.render()
+    recovered.log.close()
+
+
+def test_recovery_requeues_a_root_whose_source_was_only_in_memory(tmp_path):
+    engine = OptChatEngine(tmp_path, node_bytes=16, summarize=FakeSummarizer())
+    engine.on_session_start("session")
+    engine.on_turn_complete([{"role": "user", "content": "first"}])
+    # A long record the derived state never saw: the log has it, the tree does not,
+    # and its source text existed only in the crashed process's memory.
+    index = engine.log.append("echo", "a tool result far longer than the node budget")
+    engine.tree.save()
+    engine.view.save()
+    engine.log.close()
+
+    recovered = OptChatEngine(tmp_path, node_bytes=16, summarize=FakeSummarizer())
+    recovered.on_session_start("session")
+
+    assert recovered.tree.get(0, index) is None       # queued; too long to be free
+    recovered.compactor.run_pending(limit=1)
+    assert recovered.tree.get(0, index) is not None   # built from the recovered source
+    recovered.log.close()

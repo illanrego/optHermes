@@ -187,10 +187,39 @@ class OptChatEngine(ContextEngine):
                 self._turn_tools = self.get_tool_schemas()
             self.compactor.system = self._turn_system
             self.compactor.tools = self._turn_tools
+            self._recover()
         except BaseException:
             self.log.close()
             self.log = None
             raise
+
+    def _recover(self) -> None:
+        """Reconcile the derived state with the log after a restart or a crash.
+
+        The log is the source of truth. Every record needs a level-0 node - its text
+        is in the log, so a long source is never stranded in memory - and the view
+        must cover every record. The view is extended, never rebuilt: a rebuilt view
+        renders differently and kills every cache entry (spec section 3).
+        """
+        log, tree, view, compactor = self.log, self.tree, self.view, self.compactor
+        end = view._end()
+        recovered = 0
+        for i in range(log.count()):
+            if tree.get(0, i) is not None:
+                continue
+            record = log.get(i)
+            if record is None:
+                continue
+            compactor.seed(i, record.text, record.kind)
+            recovered += 1
+            if i == end:
+                view.add_root(i)
+                end += 1
+        if recovered:
+            # Free work only: starting a session must never wait on a model call.
+            compactor.run_pending(limit=8, model_calls=False)
+            tree.save()
+            view.save()
 
     def _check_compaction_route(self) -> None:
         """Report an explicit aux route without changing the host's routing."""
