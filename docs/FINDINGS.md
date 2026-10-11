@@ -16,8 +16,8 @@ below is **not yet implemented** as of this file.
 |---|---|---|---|---|
 | WP1 | #9, reasoning-summary, #18 | turn boundary, a reasoning-only summary, the host home | sol @ high | DONE (9e3efed) |
 | WP2 | #13, #19 (attribution) | kinds and attribution, before more history is built | sol @ high | DONE (53f2c2b) |
-| WP3 | #2, #3, #4 | compaction request identity and routing (cache) | astra @ high | RUNNING |
-| WP4 | #5, #8 | maintained views, scheduling, admission (cache) | astra @ high | TODO |
+| WP3 | #2, #3, #4 | compaction request identity and routing (cache) | astra @ high | DONE (39d5dfb) |
+| WP4 | #5, #8 | maintained views, scheduling, admission (cache) | astra @ high | RUNNING |
 | WP5 | #1, #7 | provider-aware cache planning (cache) | astra @ high | TODO |
 | WP6 | #10, #11, #12, tree tail | ingestion identity and recovery | astra @ high | TODO |
 | WP7 | #14, #15 | child identity and navigation | sol @ high | TODO |
