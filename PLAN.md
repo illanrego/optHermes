@@ -221,6 +221,23 @@ Findings and their state:
   host's media plumbing.
 - Catalog submission; multi-provider cache marks.
 
+### Wrongly parked as a "feature" - being implemented (revision 3)
+
+- **Per-subagent logs and `zoom("Name")`.** These are the design, not an add-on:
+  `zoom("Name") gives an agent's whole chat` is in the canonical tool list, and the spec says a
+  subagent's *"own steps stay in its own log (`zoom("Name")`), out of the chat"*. They were
+  lost to a shortcut of ours - we gated children out of writing entirely instead of giving each
+  child its own log, keeping "out of the chat" and deleting "its own log". Being implemented: a
+  child writes to `<root>/agents/<key>/`, the master keeps one `work` record, and
+  `optchat_zoom` takes a string to open that child's chat.
+- **Media.** `zoom(id, 1) gives message id whole, with its images` is the design too. Being
+  implemented: a message's media is archived under `<root>/assets/` and returned by
+  `zoom(id, 1)`; the view and the compactor stay text-only.
+
+### Not ours
+
+Catalog submission (distribution) and multi-provider cache marks (host-side).
+
 ### Faithful, verified
 
 Log rules (append-only, one writer, fsync, day-split, thoughts never logged, tool output

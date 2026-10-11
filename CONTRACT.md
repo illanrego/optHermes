@@ -275,3 +275,43 @@ preserving build-once and the children-before-parent rule.
 
 Media and asset archiving; per-subagent logs and `zoom("Name")` (children do not write, so
 there is no child log to open); catalog submission; multi-provider cache marks.
+
+---
+
+# Revision 3 - the design, not an optimisation (2026-10-10)
+
+Two items I had labelled "parked features" are part of the original design, and both were lost
+to a shortcut of ours. The canonical tool list says
+`zoom(id, 1) gives message id whole, with its images` and
+`zoom("Name") gives an agent's whole chat`; spec section 6 says a subagent's *"own steps stay in
+its own log (`zoom("Name")`), out of the chat"*.
+
+The shortcut: when a `delegate_task` child's engine clone appended its own turns into the
+master's chat, children were gated out of writing entirely. The design's answer is different -
+the child writes to **its own log**, and only its final report reaches the chat as one `work`
+message. We kept "out of the chat" and deleted "its own log", which is exactly the log
+`zoom("Name")` opens.
+
+## Per-subagent logs and `zoom("Name")`
+
+- A child (`platform="subagent"`) **reads** the master's view (its first message is the view)
+  and **writes** to its own chat root, `<root>/agents/<key>/`, with its own Log, Tree, View and
+  Compactor. It writes nowhere else.
+- The master's chat gets exactly one `work` record per child, starting `[Name]`.
+- `optchat_zoom` accepts a **string** id as well as an integer. A string resolves to a child's
+  chat and returns it (that child's rendered view - its whole chat); an integer keeps the
+  halving behaviour.
+- The name-to-key mapping is recorded at `<root>/agents/index.json` when the master logs the
+  `work` record, so the name the model reads in the record is the name it can zoom by.
+- `[Name]` is whatever the delegate result provides, else the child's key.
+
+## Media
+
+- `zoom(id, 1)` returns the message whole **with its media**: image/audio/file parts are
+  archived under `<root>/assets/` at ingestion and referenced from the returned payload.
+- Media never enters the view or a compaction prompt as base64. The view and the compactor stay
+  text-only, and a fabricated placeholder never stands in for content.
+
+## Not ours
+
+Catalog submission (distribution) and multi-provider cache marks (host-side).
