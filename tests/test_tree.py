@@ -73,3 +73,45 @@ def test_save_load_round_trip_and_torn_tail(tmp_path):
     restored.save()
     assert path.read_bytes().startswith(raw)
     assert Tree(tmp_path).get(0, 2).text == "gamma"
+
+
+def test_parseable_torn_tail_node_is_recovered(tmp_path):
+    tree = Tree(tmp_path)
+    tree.put(0, 0, "alpha")
+    tree.put(0, 1, "beta")
+    tree.save()
+    path = next((tmp_path / "tree").glob("*.jsonl"))
+
+    # A complete node whose newline never landed: skipping it would lose a node
+    # that was already built, and build-once means it must not be rebuilt.
+    node = {"l": 1, "i": 0, "text": "alpha\nbeta", "size": len("alpha\nbeta".encode("utf-8"))}
+    with path.open("ab") as stream:
+        stream.write(json.dumps(node).encode("utf-8"))
+
+    restored = Tree(tmp_path)
+    assert restored.get(1, 0).text == "alpha\nbeta"
+
+
+def test_duplicate_node_with_different_text_is_rejected(tmp_path):
+    tree = Tree(tmp_path)
+    tree.put(0, 0, "alpha")
+    tree.save()
+    path = next((tmp_path / "tree").glob("*.jsonl"))
+    with path.open("ab") as stream:
+        stream.write(json.dumps({"l": 0, "i": 0, "text": "other", "size": 5}).encode() + b"\n")
+
+    with pytest.raises(ValueError, match="twice with different text"):
+        Tree(tmp_path)
+
+
+def test_identical_duplicate_node_is_tolerated(tmp_path):
+    # A crash between writing a node and dequeuing it re-writes the same line on
+    # the next save; that is not a build-once violation and must load cleanly.
+    tree = Tree(tmp_path)
+    tree.put(0, 0, "alpha")
+    tree.save()
+    path = next((tmp_path / "tree").glob("*.jsonl"))
+    with path.open("ab") as stream:
+        stream.write(json.dumps({"l": 0, "i": 0, "text": "alpha", "size": 5}).encode() + b"\n")
+
+    assert Tree(tmp_path).get(0, 0).text == "alpha"

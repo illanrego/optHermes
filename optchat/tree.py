@@ -10,6 +10,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+from .persistence import read_jsonl
+
 
 @dataclass(frozen=True)
 class Line:
@@ -121,27 +123,34 @@ class Tree:
         self._nodes.clear()
         self._ready.clear()
         self._ready_set.clear()
-        restored: list[Line] = []
+        restored: dict[tuple[int, int], Line] = {}
         for path in sorted((self.root / "tree").glob("????-??-??.jsonl")):
-            with path.open("rb") as stream:
-                for raw in stream:
-                    if not raw.endswith(b"\n"):
-                        continue
-                    try:
-                        line = Line(**json.loads(raw))
-                        valid = (
-                            isinstance(line.l, int)
-                            and isinstance(line.i, int)
-                            and line.l >= 0
-                            and line.i >= 0
-                            and isinstance(line.text, str)
-                            and line.size == len(line.text.encode("utf-8"))
-                        )
-                        if valid:
-                            restored.append(line)
-                    except (UnicodeError, ValueError, TypeError, KeyError):
-                        continue
-        for line in sorted(restored, key=lambda item: (item.l, item.i)):
+            # Same tail rule as the log: a node missing only its newline is kept
+            # (read_jsonl seals it), a sealed fragment is skipped, and mid-file
+            # corruption raises.
+            for _offset, data in read_jsonl(path):
+                try:
+                    line = Line(**data)
+                    valid = (
+                        isinstance(line.l, int)
+                        and isinstance(line.i, int)
+                        and line.l >= 0
+                        and line.i >= 0
+                        and isinstance(line.text, str)
+                        and line.size == len(line.text.encode("utf-8"))
+                    )
+                except (TypeError, KeyError):
+                    continue
+                if not valid:
+                    continue
+                key = (line.l, line.i)
+                previous = restored.get(key)
+                if previous is not None and previous.text != line.text:
+                    # Build-once is the invariant; a second, different text for
+                    # the same node means one of them is not the built line.
+                    raise ValueError(f"Tree node {key} was written twice with different text")
+                restored[key] = line
+        for line in sorted(restored.values(), key=lambda item: (item.l, item.i)):
             try:
                 self._insert(line, pending=False)
             except ValueError:

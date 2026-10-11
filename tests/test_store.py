@@ -90,3 +90,56 @@ def test_reload_uses_ids_when_calendar_moves_backward(tmp_path):
             log.append("unii", "second")
     with Log(tmp_path) as reopened:
         assert [record.text for record in reopened.range(0, 1)] == ["first", "second"]
+
+
+def test_parseable_torn_tail_is_recovered_and_never_collides(tmp_path):
+    with Log(tmp_path) as log:
+        assert log.append("user", "first") == 0
+        date = log.get(0).date
+        path = tmp_path / "main" / (date[:10] + ".jsonl")
+
+    # A complete record whose newline never landed. It parses, so skipping it
+    # would let the next append reuse id 1 and make this record unreachable.
+    torn = json.dumps({"id": 1, "kind": "note", "text": "torn", "size": 4,
+                       "date": date}).encode("utf-8")
+    with path.open("ab") as stream:
+        stream.write(torn)
+
+    with Log(tmp_path) as log:
+        assert log.count() == 2
+        assert log.get(1).text == "torn"
+        assert log.append("user", "after") == 2
+        assert log.get(2).text == "after"
+
+    with Log(tmp_path) as reopened:
+        assert [record.text for record in reopened.range(0, 2)] == ["first", "torn", "after"]
+
+
+def test_duplicate_record_ids_are_rejected(tmp_path):
+    with Log(tmp_path) as log:
+        log.append("user", "first")
+        date = log.get(0).date
+        path = tmp_path / "main" / (date[:10] + ".jsonl")
+
+    duplicate = json.dumps({"id": 0, "kind": "user", "text": "copy", "size": 4,
+                            "date": date}) + "\n"
+    with path.open("ab") as stream:
+        stream.write(duplicate.encode("utf-8"))
+
+    with pytest.raises(ValueError, match="two records with id 0"):
+        Log(tmp_path)
+
+
+def test_mid_file_corruption_is_loud(tmp_path):
+    with Log(tmp_path) as log:
+        log.append("user", "first")
+        log.append("note", "second")
+        date = log.get(0).date
+        path = tmp_path / "main" / (date[:10] + ".jsonl")
+
+    lines = path.read_bytes().splitlines(keepends=True)
+    lines.insert(1, b'{"broken"\n')
+    path.write_bytes(b"".join(lines))
+
+    with pytest.raises(ValueError, match="Corrupt JSONL record"):
+        Log(tmp_path)

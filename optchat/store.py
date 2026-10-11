@@ -9,6 +9,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+from .persistence import read_jsonl
+
 
 KINDS = frozenset({"user", "unii", "tool", "echo", "work", "note"})
 
@@ -49,30 +51,34 @@ class Log:
         main = self.root / "main"
         found: dict[int, tuple[Path, int]] = {}
         for path in sorted(main.glob("????-??-??.jsonl")):
-            with path.open("rb") as stream:
-                while True:
-                    offset = stream.tell()
-                    raw = stream.readline()
-                    if not raw:
-                        break
-                    if not raw.endswith(b"\n"):
-                        continue
-                    try:
-                        data = json.loads(raw)
-                        record = Record(**data)
-                        valid = (
-                            isinstance(record.id, int)
-                            and record.id >= 0
-                            and record.kind in KINDS
-                            and isinstance(record.text, str)
-                            and isinstance(record.date, str)
-                            and record.date[:10] == path.stem
-                            and record.size == len(record.text.encode("utf-8"))
-                        )
-                    except (UnicodeError, ValueError, TypeError, KeyError):
-                        continue
-                    if valid and record.id not in found:
-                        found[record.id] = (path, offset)
+            # read_jsonl seals a torn tail: a complete record missing only its
+            # newline is indexed (and the file made whole), while an unparseable
+            # fragment is marked so it can never parse later. Mid-file corruption
+            # raises, because ids are the identity every other module keys on.
+            for offset, data in read_jsonl(path):
+                try:
+                    record = Record(**data)
+                    valid = (
+                        isinstance(record.id, int)
+                        and record.id >= 0
+                        and record.kind in KINDS
+                        and isinstance(record.text, str)
+                        and isinstance(record.date, str)
+                        and record.date[:10] == path.stem
+                        and record.size == len(record.text.encode("utf-8"))
+                    )
+                except (TypeError, KeyError):
+                    continue
+                if not valid:
+                    continue
+                if record.id in found:
+                    # First-wins would make the later record unreachable and let
+                    # the next append reuse its id, losing it for good.
+                    raise ValueError(
+                        f"Chat log has two records with id {record.id}: "
+                        f"{found[record.id][0].name} and {path.name}"
+                    )
+                found[record.id] = (path, offset)
         if set(found) != set(range(len(found))):
             raise ValueError("Chat log has a gap in its record IDs")
         self._index = [found[i] for i in range(len(found))]
