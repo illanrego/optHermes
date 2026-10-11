@@ -13,7 +13,7 @@ kind-prefixed message, and the byte limit and ruler are parameterised.
 """
 
 SYSTEM_PROMPT = """The view is the whole chat, oldest first, inside <chat> tags, with one line per node. A line has the form id+n|text: it covers the n messages from id on, with newlines shown as spaces. A line can contain user, unii, tool, echo, work, or note messages. A message not summarized yet appears as (not summarized yet: zoom it). The view is your memory, and its latest word on a thing is the truth.
-Use optchat_zoom(id, n) to open line id+n into the two lines it was made from; optchat_zoom(id, 1) gives the message whole. Use optchat_date(id) to get a message's date and time. Never grep or search memories manually; optchat_zoom is your only allowed mechanism to navigate the tree.
+Use optchat_zoom(id, n) to open line id+n into the two lines it was made from; optchat_zoom(id, 1) gives the message whole. Use optchat_date(id) to get a message's date and time. An id without a scope resolves against the chat whose view you are reading; a subagent's chat opens by name, optchat_zoom("Name"), and names the scope to pass back (scope="Name") to open a line inside it. Never grep or search memories manually; optchat_zoom is your only allowed mechanism to navigate the tree.
 If a summary bears on your task, zoom until you have it whole before you act, guess or ask.
 After using a tool or learning something consequential, say in your reply what you learned.
 In the chat and in summaries, the user's words matter most.

@@ -29,16 +29,23 @@ class LogLockedError(RuntimeError):
 
 
 class Log:
-    def __init__(self, root: Path):
+    def __init__(self, root: Path, *, read_only: bool = False):
         self.root = Path(root)
-        self.root.mkdir(parents=True, exist_ok=True)
-        self._lock_fd = os.open(self.root / "lock", os.O_CREAT | os.O_RDWR, 0o600)
-        try:
-            fcntl.flock(self._lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as exc:
-            os.close(self._lock_fd)
+        self._read_only = bool(read_only)
+        if self._read_only:
+            # A lock-free read handle for another chat: the chat's owner may hold
+            # the exclusive lock in this process or another one. It never writes,
+            # so it neither locks, creates directories, nor seals a tail.
             self._lock_fd = None
-            raise LogLockedError(f"Chat log is locked: {self.root}") from exc
+        else:
+            self.root.mkdir(parents=True, exist_ok=True)
+            self._lock_fd = os.open(self.root / "lock", os.O_CREAT | os.O_RDWR, 0o600)
+            try:
+                fcntl.flock(self._lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                os.close(self._lock_fd)
+                self._lock_fd = None
+                raise LogLockedError(f"Chat log is locked: {self.root}") from exc
 
         self._index: list[tuple[Path, int]] = []
         try:
@@ -55,7 +62,8 @@ class Log:
             # newline is indexed (and the file made whole), while an unparseable
             # fragment is marked so it can never parse later. Mid-file corruption
             # raises, because ids are the identity every other module keys on.
-            for offset, data in read_jsonl(path):
+            # A read-only handle skips the repair and only reports what it sees.
+            for offset, data in read_jsonl(path, seal=not self._read_only):
                 try:
                     record = Record(**data)
                     valid = (
@@ -84,6 +92,8 @@ class Log:
         self._index = [found[i] for i in range(len(found))]
 
     def append(self, kind: str, text: str) -> int:
+        if self._read_only:
+            raise ValueError("Log is read-only")
         if kind not in KINDS:
             raise ValueError(f"Invalid record kind: {kind!r}")
         if not isinstance(text, str):

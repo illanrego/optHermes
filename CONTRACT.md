@@ -514,6 +514,44 @@ a boundary that could duplicate history.
 
 ---
 
+# Revision 9 - child identity and navigation (2026-10-11)
+
+WP7. Navigation namespaces are explicit, and a child report is addressable in the turn it returns.
+
+## The navigation scope
+
+`optchat_zoom` and `optchat_date` accept an optional `scope` (a subagent's name):
+
+- Without `scope`, an integer `id` resolves against the log whose view the caller is reading: the
+  master's log/tree for the master and for a child (a child renders the master's view). A child's
+  own chat is reached only with an explicit scope.
+- With `scope="Name"`, the name is resolved through `<root>/agents/index.json` and `id` resolves
+  against that child's chat (`<root>/agents/<key>/`). A string `id` opens its own child chat and
+  must not be combined with `scope`.
+- An unknown, empty, or unmapped scope is an error; navigation never falls back to another
+  namespace silently. The scoped log opens read-only, because the child's own engine may still
+  hold the chat's lock.
+- Every zoom/date payload carries `scope` (the name, or null for the reading view); a child chat
+  returned by `optchat_zoom("Name")` names its scope so its ids can be opened with
+  `optchat_zoom(id, n, scope="Name")`. The system prompt states the rule.
+
+`Log(root, read_only=False)` is the lock-free read handle for opening another chat's log while its
+owner holds the exclusive lock. It never writes: no lock, no directory creation, no tail sealing,
+and `append` raises. `read_jsonl(path, seal=False)` is its non-writing reader.
+`optchat.tools.child_chat_root(root, name)` resolves a name to a safe chat directory or `None`
+(the mapped key must be a single safe path component).
+
+## Registration on arrival
+
+`name -> child key` is recorded when a delegate result first becomes visible to the engine - during
+selection of the running turn's request, not only at `on_turn_complete` - so the report is zoomable
+by name in the same turn. The row's arrival resolution is reused at ingestion, so the logged
+`[Name]` always matches the registered mapping. A name already mapped to a different child keeps
+its first mapping and warns once (per name, per engine); re-registering the same pair is
+idempotent. The host half (a delegate result carrying `child_session_id`) remains an upstream ask.
+
+---
+
 # Structural rules - laws enforced by absence (2026-10-11)
 
 A law that must hold is enforced by **absence**, not by instruction. A prompt line is a preference

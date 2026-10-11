@@ -25,15 +25,19 @@ def atomic_json(path: Path, value: object) -> None:
     sync_directory(path.parent)
 
 
-def read_jsonl(path: Path):
+def read_jsonl(path: Path, *, seal: bool = True):
     """Yield (byte offset, JSON value), sealing only an interrupted final line.
 
     Valid JSON needs just its newline. Invalid tail bytes are retained and sealed
     with NUL + newline: the NUL makes that fragment permanently invalid, even if
     it ended at a JSON boundary. Only these explicitly sealed fragments may be
     ignored on subsequent loads; ordinary mid-file corruption raises.
+
+    ``seal=False`` is the read-only mode: the file is never written. A complete
+    record missing only its newline is still yielded, and an unparseable tail
+    fragment is skipped - a later writer seals it.
     """
-    with path.open("r+b") as stream:
+    with path.open("r+b" if seal else "rb") as stream:
         while True:
             offset = stream.tell()
             raw = stream.readline()
@@ -44,14 +48,15 @@ def read_jsonl(path: Path):
                 data = json.loads(raw)
             except (UnicodeError, ValueError) as exc:
                 if tail:
-                    stream.write(b"\x00\n")
-                    stream.flush()
-                    os.fsync(stream.fileno())
+                    if seal:
+                        stream.write(b"\x00\n")
+                        stream.flush()
+                        os.fsync(stream.fileno())
                     return
                 if raw.endswith(b"\x00\n"):
                     continue
                 raise ValueError(f"Corrupt JSONL record at {path}:{offset}") from exc
-            if tail:
+            if tail and seal:
                 stream.write(b"\n")
                 stream.flush()
                 os.fsync(stream.fileno())

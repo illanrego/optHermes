@@ -15,6 +15,15 @@ The retained request tail starts at the host's ``incoming_message`` when that
 message is present in the request (identity first, then equality). Otherwise it
 starts at the last user row. A later steering user row stays in the same turn.
 
+Navigation is scope-explicit. An integer id without a scope resolves against the
+log whose view the caller is reading - the master's, for the master and for a
+child rendering the master's view; a child's own chat is reached only with an
+explicit scope. ``scope="Name"`` resolves against that child's chat, and an
+unknown or unmapped scope is an error, never a silent fallback. A delegate
+result's name-to-child mapping is registered as soon as the result is visible to
+a selection of the running turn, not only at ``on_turn_complete``; a name already
+mapped to a different child keeps its first mapping and warns once.
+
 The host ABC is imported here, rather than by the package entry point. When
 Hermes is absent, a local base permits standalone unit tests; an engine loaded
 inside Hermes inherits the real ABC. This binding is fixed at module import.
@@ -140,6 +149,8 @@ class OptChatEngine(ContextEngine):
         self.view: View | None = None
         self.compactor: Compactor | None = None
         self._master_view: View | None = None
+        self._master_log: Log | None = None
+        self._master_tree: Tree | None = None
         self._chat_root = self.root
         self._turn_system = ""
         self._turn_tools: list[dict[str, Any]] = []
@@ -149,6 +160,12 @@ class OptChatEngine(ContextEngine):
         self._warned_route_override = False
         self._session_id = ""
         self._warned_ingest_boundary = False
+        self._warned_child_conflicts: set[str] = set()
+        # Delegate results already seen by a selection of the running turn, keyed
+        # by row fingerprint: ``_arrived_rows`` guards against re-resolving a row,
+        # ``_arrived_records`` carries its resolution to ingestion.
+        self._arrived_rows: set[str] = set()
+        self._arrived_records: dict[str, list[tuple[str, str, str | None]]] = {}
         # Cron reads only; a child writes to its own chat after session start.
         self._writes = False
         self.last_prompt_tokens = 0
@@ -181,11 +198,18 @@ class OptChatEngine(ContextEngine):
         if platform == "subagent":
             if not session_id or Path(session_id).name != session_id or session_id in (".", ".."):
                 raise ValueError("Subagent session id must be a safe path component")
-            if self._master_view is None:
+            # A child renders the master's view, so the ids in front of it are the
+            # master's: keep the master's view, log and tree before the child gets
+            # its own. The split happens once; a later call for the same child must
+            # not re-capture the child's own objects as the master's.
+            if self._master_view is None and self._chat_root == self.root:
                 self._master_view = self.view
                 if self._master_view is None and (self.root / "view.json").is_file():
                     self._master_view = View(Tree(self.root, self.node_bytes),
                                              self.view_min_bytes, self.view_max_bytes)
+            if self._master_log is None and self._chat_root == self.root and self.log is not None:
+                self._master_log = self.log
+                self._master_tree = self.tree
             child_root = self.root / "agents" / session_id
             if self._chat_root == child_root and self.log is not None:
                 return
@@ -340,6 +364,10 @@ class OptChatEngine(ContextEngine):
                 system[0]["content"] = content + "\n\n" + SYSTEM_PROMPT
         turn = [copy.deepcopy(message) for message in request_messages[turn_start:]]
         _, tree, view, compactor = self._open()
+        # A delegate result is visible in the running turn's request before the
+        # turn completes; registering it here makes the report zoomable by name
+        # in the same turn.
+        self._register_arrived_delegates(request_messages, turn_start)
         self._turn_system = _content_text(system[0].get("content"))
         compactor.system = self._turn_system
         compactor.tools = self._turn_tools
@@ -365,28 +393,97 @@ class OptChatEngine(ContextEngine):
 
     def get_tool_schemas(self) -> list[dict[str, Any]]:
         integer = {"type": "integer"}
+        zoom_scope = {"type": "string",
+                      "description": "A subagent's name: resolve the id against that "
+                                     "child's chat instead of the chat whose view you "
+                                     "are reading."}
+        date_scope = {"type": "string",
+                      "description": "A subagent's name: read the id from that child's "
+                                     "chat instead of the chat whose view you are reading."}
         return [
             {"type": "function", "function": {"name": "optchat_zoom",
-                "description": "Open a child chat by name, a chat span, or a raw message.",
+                "description": "Open a child chat by name, a chat span, or a raw message. "
+                               "Without scope, an integer id resolves against the chat "
+                               "whose view you are reading; a returned child chat names "
+                               "the scope its ids resolve with.",
                 "parameters": {"type": "object", "properties": {
-                    "id": {"anyOf": [{"type": "integer"}, {"type": "string"}]}, "n": integer},
+                    "id": {"anyOf": [{"type": "integer"}, {"type": "string"}]},
+                    "n": integer, "scope": zoom_scope},
                                "required": ["id"]}}},
             {"type": "function", "function": {"name": "optchat_date",
-                "description": "Get the stored ISO timestamp of a raw message.",
-                "parameters": {"type": "object", "properties": {"id": integer},
+                "description": "Get the stored ISO timestamp of a raw message, from the "
+                               "chat whose view you are reading or from the subagent's "
+                               "chat named by scope.",
+                "parameters": {"type": "object", "properties": {"id": integer, "scope": date_scope},
                                "required": ["id"]}}},
         ]
+
+    def _reading_scope(self) -> tuple[Log, Tree, View | None]:
+        """The chat whose view this caller is reading.
+
+        The master reads its own view. A child renders the master's view, so the
+        ids in front of it are the master's, not its own chat's; the child's own
+        chat is reached only with an explicit scope.
+        """
+        if self._chat_root == self.root:
+            log, tree, view, _ = self._open()
+            return log, tree, view
+        if self._master_log is None:
+            self._master_log = Log(self.root, read_only=True)
+        if self._master_tree is None:
+            self._master_tree = (self._master_view.tree if self._master_view is not None
+                                 else Tree(self.root, self.node_bytes))
+        return self._master_log, self._master_tree, self._master_view
+
+    def _child_scope(self, scope: str) -> tuple[Log, Tree] | str:
+        """Open a named child's chat for scoped navigation, or a JSON error payload.
+
+        The name is resolved through ``<root>/agents/index.json``; an unmapped or
+        unsafe name, and a mapped name with no chat, are errors - navigation never
+        falls back to another namespace. The log opens read-only because the
+        child's own engine may still hold its lock.
+        """
+        child_root = opt_tools.child_chat_root(self.root, scope)
+        if child_root is None:
+            return json.dumps({"error": f"unknown scope: {scope!r}"})
+        if not (child_root / "view.json").is_file():
+            return json.dumps({"error": f"scope {scope!r} has no chat"})
+        try:
+            return Log(child_root, read_only=True), Tree(child_root, self.node_bytes)
+        except (OSError, ValueError) as exc:
+            return json.dumps({"error": f"scope {scope!r} cannot be read: {exc}"})
 
     def handle_tool_call(self, name: str, args: dict[str, Any], **kwargs: Any) -> str:
         if not isinstance(args, dict):
             return json.dumps({"error": "tool arguments must be an object"})
-        log, tree, view, _ = self._open()
+        if name not in ("optchat_zoom", "optchat_date"):
+            return json.dumps({"error": f"Unknown context engine tool: {name}"})
+        self._open()
+        scope = args.get("scope")
+        if scope is not None and (not isinstance(scope, str) or not scope):
+            return json.dumps({"error": "scope must be a nonempty subagent name"})
         if name == "optchat_zoom":
+            if scope is not None:
+                if isinstance(args.get("id"), str):
+                    return json.dumps({"error": "a string id opens its own chat; "
+                                                "do not pass scope with it"})
+                child = self._child_scope(scope)
+                if isinstance(child, str):
+                    return child
+                child_log, child_tree = child
+                return opt_tools.zoom(child_log, child_tree, None, args.get("id"),
+                                      args.get("n", 1), scope=scope)
+            log, tree, view = self._reading_scope()
             return opt_tools.zoom(log, tree, view, args.get("id"), args.get("n", 1),
                                   master_root=self.root)
         if name == "optchat_date":
+            if scope is not None:
+                child = self._child_scope(scope)
+                if isinstance(child, str):
+                    return child
+                return opt_tools.date(child[0], args.get("id"), scope=scope)
+            log, _tree, _view = self._reading_scope()
             return opt_tools.date(log, args.get("id"))
-        return json.dumps({"error": f"Unknown context engine tool: {name}"})
 
     @staticmethod
     def _records(message: dict[str, Any], node_bytes: int,
@@ -468,6 +565,71 @@ class OptChatEngine(ContextEngine):
             os.fsync(stream.fileno())
         os.replace(temporary, path)
 
+    def _register_child(self, name: str, key: str) -> None:
+        """Record ``name -> key``; an existing mapping to another child is kept.
+
+        The first mapping wins: a repeated name that resolves to a different child
+        warns once (per name) instead of silently repointing the model at another
+        chat. Re-registering the same pair is idempotent.
+        """
+        index = self._child_index()
+        existing = index.get(name)
+        if existing == key:
+            return
+        if existing is not None:
+            if name not in self._warned_child_conflicts:
+                self._warned_child_conflicts.add(name)
+                warnings.warn(
+                    f"OptChat: subagent name {name!r} already maps to child {existing!r}; "
+                    f"keeping it and ignoring child {key!r}.",
+                    RuntimeWarning, stacklevel=2)
+            return
+        index[name] = key
+        self._save_child_index(index)
+
+    def _register_arrived_delegates(self, messages: list[dict[str, Any]], start: int) -> None:
+        """Register ``name -> child`` for delegate results already visible this turn.
+
+        The host shows the running turn's rows to ``select_context`` as they arrive,
+        so a report can be zoomed by name in the turn it returns, not only after
+        ``on_turn_complete`` ingests it. Each result row is resolved once (by row
+        fingerprint) and its resolution is kept for ingestion, so the logged
+        ``[Name]`` always matches the registered mapping. Rows before the turn
+        boundary are left to ingestion.
+        """
+        if not self._writes or self._chat_root != self.root:
+            return
+        tool_names: dict[str, str] = {}
+        for message in messages:
+            if message.get("role") != "assistant":
+                continue
+            for call in message.get("tool_calls") or []:
+                function = call.get("function") if isinstance(call, dict) else None
+                if (isinstance(call.get("id"), str) and isinstance(function, dict)
+                        and isinstance(function.get("name"), str)):
+                    tool_names[call["id"]] = function["name"]
+        try:
+            for message in messages[start:]:
+                if message.get("role") != "tool":
+                    continue
+                call_id = message.get("tool_call_id")
+                if not isinstance(call_id, str) or tool_names.get(call_id) != "delegate_task":
+                    continue
+                fingerprint = _row_fingerprint(message)
+                if fingerprint in self._arrived_rows:
+                    continue
+                self._arrived_rows.add(fingerprint)
+                known_keys = set(self._child_index().values())
+                resolved = self._delegate_work(_content_text(message.get("content")), known_keys)
+                if not resolved:
+                    continue
+                self._arrived_records[fingerprint] = resolved
+                for name, _record, key in resolved:
+                    if key is not None:
+                        self._register_child(name, key)
+        except (OSError, ValueError) as exc:
+            logger.warning("OptChat could not register an arrived subagent report: %s", exc)
+
     def _delegate_work(self, text: str, known_keys: set[str]) -> list[tuple[str, str, str | None]]:
         """Return (label, record text, child key) for a completed delegate result."""
         try:
@@ -541,8 +703,17 @@ class OptChatEngine(ContextEngine):
             if row < start:
                 continue
             if tool_name == "delegate_task" and self._chat_root == self.root:
-                records = [("work", record, name, key) for name, record, key in
-                           self._delegate_work(_content_text(message.get("content")), known_keys)]
+                arrived = self._arrived_records.pop(_row_fingerprint(message), None)
+                if arrived is not None:
+                    # A selection of this running turn already resolved the row;
+                    # reuse it so the logged [Name] matches the registered mapping.
+                    records = [("work", record, name, key) for name, record, key in arrived]
+                    for _name, _record, key in arrived:
+                        if key is not None:
+                            known_keys.add(key)
+                else:
+                    records = [("work", record, name, key) for name, record, key in
+                               self._delegate_work(_content_text(message.get("content")), known_keys)]
             else:
                 records = [(kind, text, None, None) for kind, text in
                            self._records(message, self.node_bytes, tool_name)]
@@ -553,8 +724,7 @@ class OptChatEngine(ContextEngine):
                 compactor.seed(index, text, kind)
                 view.add_root(index)
                 if name is not None and key is not None:
-                    child_index[name] = key
-                    self._save_child_index(child_index)
+                    self._register_child(name, key)
             # Advance only once every record of this row is durable, so a crash
             # mid-row re-ingests that row instead of skipping its other records.
             recent.append(_row_fingerprint(message))
@@ -597,6 +767,8 @@ class OptChatEngine(ContextEngine):
             self.log, self.tree, self.view, self.compactor)
         clone._chat_root = self._chat_root
         clone._master_view = self._master_view
+        clone._master_log = self._master_log
+        clone._master_tree = self._master_tree
         clone._session_id = self._session_id
         clone._writes = self._writes
         clone._turn_system = self._turn_system

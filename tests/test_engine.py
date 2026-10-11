@@ -12,9 +12,11 @@ from pathlib import Path
 import pytest
 
 from optchat import OptChatEngine
+from optchat.compactor import Compactor
 from optchat.prompts import SYSTEM_PROMPT
 from optchat.store import Log
 from optchat.tree import Tree
+from optchat.view import View
 
 
 class FakeSummarizer:
@@ -470,6 +472,169 @@ def test_delegate_name_maps_to_explicit_child_session_id(tmp_path):
         "Researcher": "child-session"}
     assert "find the answer" in json.loads(master.handle_tool_call(
         "optchat_zoom", {"id": "Researcher"}))["chat"]
+
+
+def test_child_navigation_resolves_the_view_it_reads_and_its_own_scope(tmp_path):
+    master = OptChatEngine(tmp_path, summarize=FakeSummarizer())
+    master.on_session_start("master", platform="cli")
+    master.on_turn_complete([{"role": "user", "content": "master context"}])
+
+    child = master.clone_for_agent()
+    child.on_session_start("child-session", platform="subagent")
+    child.on_turn_complete([{"role": "user", "content": "child step"}])
+    (tmp_path / "agents" / "index.json").write_text(
+        json.dumps({"child-session": "child-session"}), encoding="utf-8")
+
+    # The child renders the master's view, so id 0 is the master's record, not
+    # the child's own record 0.
+    whole = json.loads(child.handle_tool_call("optchat_zoom", {"id": 0, "n": 1}))
+    assert whole["text"] == "master context"
+    assert whole["scope"] is None
+    assert json.loads(child.handle_tool_call(
+        "optchat_date", {"id": 0}))["date"] == master.log.get(0).date
+
+    # The child's own chat needs its explicit scope, even while its own log holds
+    # the lock (the scoped handle opens read-only).
+    own = json.loads(child.handle_tool_call(
+        "optchat_zoom", {"id": 0, "n": 1, "scope": "child-session"}))
+    assert own["text"] == "child step"
+    assert own["scope"] == "child-session"
+    assert json.loads(child.handle_tool_call(
+        "optchat_date", {"id": 0, "scope": "child-session"}))["date"] == child.log.get(0).date
+
+
+def test_named_child_chat_names_its_scope_and_opens_lines_inside(tmp_path):
+    child_root = tmp_path / "agents" / "child-session"
+    with Log(child_root) as child_log:
+        child_tree = Tree(child_root)
+        child_view = View(child_tree)
+        compactor = Compactor(child_tree, lambda prompt: "summary")
+        for text in ("first step", "second step"):
+            index = child_log.append("user", text)
+            compactor.seed(index, text, "user")
+            child_view.add_root(index)
+        compactor.run_pending()
+        child_tree.save()
+        child_view.save()
+    (tmp_path / "agents" / "index.json").write_text(
+        json.dumps({"Researcher": "child-session"}), encoding="utf-8")
+
+    engine = OptChatEngine(tmp_path, summarize=FakeSummarizer())
+    engine.on_session_start("master", platform="cli")
+
+    result = json.loads(engine.handle_tool_call("optchat_zoom", {"id": "Researcher"}))
+    assert result["name"] == "Researcher"
+    assert result["scope"] == "Researcher"
+    assert result["chat"] == "<chat>\n0+1|user: first step\n1+1|user: second step\n</chat>"
+
+    # The scope the payload names opens a line inside that chat.
+    halves = json.loads(engine.handle_tool_call(
+        "optchat_zoom", {"id": 0, "n": 2, "scope": "Researcher"}))
+    assert halves["scope"] == "Researcher"
+    assert [(half["id"], half["n"], half["text"]) for half in halves["halves"]] == [
+        (0, 1, "user: first step"), (1, 1, "user: second step")]
+    whole = json.loads(engine.handle_tool_call(
+        "optchat_zoom", {"id": 1, "n": 1, "scope": "Researcher"}))
+    assert whole["text"] == "second step"
+
+
+def test_unknown_or_invalid_scope_is_an_error_never_a_fallback(tmp_path):
+    engine = OptChatEngine(tmp_path, summarize=FakeSummarizer())
+    engine.on_session_start("master", platform="cli")
+    engine.on_turn_complete([{"role": "user", "content": "master record"}])
+
+    # Record 0 exists in the reading log, but the scope names no child: an error,
+    # never the reading log's record.
+    for args in ({"id": 0, "scope": "Missing"}, {"id": 0, "scope": ""},
+                 {"id": 0, "scope": 7}, {"id": "Missing", "scope": "Missing"}):
+        result = json.loads(engine.handle_tool_call("optchat_zoom", args))
+        assert "error" in result
+    assert "error" in json.loads(engine.handle_tool_call(
+        "optchat_date", {"id": 0, "scope": "Missing"}))
+
+    # A mapped name whose chat does not exist is also an error.
+    (tmp_path / "agents").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "agents" / "index.json").write_text(json.dumps({"Ghost": "ghost-session"}))
+    assert "error" in json.loads(engine.handle_tool_call(
+        "optchat_zoom", {"id": 0, "scope": "Ghost"}))
+    assert "error" in json.loads(engine.handle_tool_call("optchat_other", {"id": 0}))
+
+
+def test_delegate_result_is_zoomable_in_the_turn_it_arrives(tmp_path):
+    master = OptChatEngine(tmp_path, summarize=FakeSummarizer())
+    master.on_session_start("master", platform="cli")
+    child = master.clone_for_agent()
+    child.on_session_start("child-session", platform="subagent")
+    child.on_turn_complete([{"role": "user", "content": "find the answer"}])
+
+    call = {"role": "assistant", "content": None, "tool_calls": [
+        {"id": "delegate-1", "function": {"name": "delegate_task", "arguments": "{}"}}]}
+    result = {"role": "tool", "tool_call_id": "delegate-1",
+              "content": json.dumps({"results": [{"task_index": 0, "status": "completed",
+                                                  "summary": "found it"}]})}
+    request = [{"role": "user", "content": "task"}, call, result]
+
+    # The running turn's request carries the result: selection registers it at
+    # once, so the report can be zoomed before the turn completes.
+    master.select_context(request)
+    assert json.loads((tmp_path / "agents" / "index.json").read_text()) == {
+        "child-session": "child-session"}
+    zoomed = json.loads(master.handle_tool_call("optchat_zoom", {"id": "child-session"}))
+    assert "find the answer" in zoomed["chat"]
+    scoped = json.loads(master.handle_tool_call(
+        "optchat_zoom", {"id": 0, "n": 1, "scope": "child-session"}))
+    assert scoped["text"] == "find the answer"
+
+    # Turn completion reuses that resolution: one work record, named for the
+    # registered mapping (not a second, differently named one).
+    master.on_turn_complete(request)
+    assert [(record.kind, record.text) for record in master.log.range(0, master.log.count() - 1)] == [
+        ("user", "task"),
+        ("tool", '{"name": "delegate_task", "arguments": {}}'),
+        ("work", "[child-session] " + result["content"])]
+
+
+def test_repeated_name_keeps_the_first_child_and_warns_once(tmp_path):
+    master = OptChatEngine(tmp_path, summarize=FakeSummarizer())
+    master.on_session_start("master", platform="cli")
+    for key in ("child-a", "child-b"):
+        child = master.clone_for_agent()
+        child.on_session_start(key, platform="subagent")
+        child.on_turn_complete([{"role": "user", "content": f"work in {key}"}])
+
+    def result(call_id, child_key):
+        return {"role": "tool", "tool_call_id": call_id,
+                "content": json.dumps({"results": [{"name": "Researcher",
+                                                    "child_session_id": child_key,
+                                                    "summary": child_key}]})}
+
+    call = {"role": "assistant", "content": None, "tool_calls": [
+        {"id": "delegate-a", "function": {"name": "delegate_task"}},
+        {"id": "delegate-b", "function": {"name": "delegate_task"}}]}
+    messages = [{"role": "user", "content": "task"}, call,
+                result("delegate-a", "child-a"), result("delegate-b", "child-b")]
+    later = [{"role": "assistant", "content": None, "tool_calls": [
+        {"id": "delegate-c", "function": {"name": "delegate_task"}}]},
+        result("delegate-c", "child-b")]
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        master.select_context(messages)
+        master.on_turn_complete(messages)
+        master.select_context(messages + later)
+        master.on_turn_complete(messages + later)
+
+    conflicts = [item for item in caught if "already maps" in str(item.message)]
+    assert len(conflicts) == 1
+    assert conflicts[0].category is RuntimeWarning
+    index = json.loads((tmp_path / "agents" / "index.json").read_text(encoding="utf-8"))
+    assert index["Researcher"] == "child-a"
+    # The first child stays the one the name opens, by name and by scope.
+    opened = json.loads(master.handle_tool_call("optchat_zoom", {"id": "Researcher"}))
+    assert "work in child-a" in opened["chat"]
+    scoped = json.loads(master.handle_tool_call(
+        "optchat_zoom", {"id": 0, "n": 1, "scope": "Researcher"}))
+    assert scoped["text"] == "work in child-a"
 
 
 def test_cron_context_never_writes(tmp_path):
