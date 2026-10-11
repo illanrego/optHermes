@@ -432,3 +432,41 @@ and its separate total-node and deadline bounds. Its default and the synchronous
 selection path still never start a model call. A running model call cannot be
 interrupted by the deadline. Provider failures, missing sources, or a deadline can
 still leave a live placeholder; host fail-closed admission remains outside WP4.
+
+---
+
+# Revision 7 - host-owned cache policy and shared view planning (2026-10-11)
+
+- `cache_plan(messages, tools, **kwargs)` still returns a host `PromptCachePlan`
+  or `None`. It layers onto the host's explicit plan, preserving system and tool
+  markers and their TTLs. With no assistant `<chat>` view, it returns `None`.
+- `optchat.cache.plan_view_cache(messages, tools)` is the shared, request-local
+  planner. It returns copied `(messages, tools)` sections or `None`; it never
+  changes stored messages, the persisted view, or the caller's plan. The engine's
+  `_plan_cache` captures outgoing tools before calling it, for both integrations.
+- The request view is split into an opening-tag block, one block per complete
+  newline-terminated line, and a closing-tag block. The last complete line gets
+  a breakpoint; appending lines preserves the previous blocks and boundaries.
+  The closing tag is excluded from that reusable prefix. A merge or a changed
+  placeholder invalidates the affected prefix as before.
+- The planner retains or adds a request-end mark at the last legal cacheable
+  message. Tool-result eligibility and top-level versus part placement come from
+  the host's existing marks. System/tools marks are protected; excess conversation
+  marks are removed oldest first, keeping at most four breakpoints in total.
+  The host layouts reserve at most two prefix marks. A plan already reserving
+  four prefix marks is left to the host (`None`); with three, request end takes
+  priority over the view mark.
+- A view breakpoint is added only with fewer than 20 following content/tool-call
+  block positions, including the closing tag. Longer current-turn tails keep
+  the host's recent conversation marks. A growth burst beyond the provider's
+  lookback window and a batch merge can still miss the preceding view cache.
+- The seam call itself is the explicit-cache signal. The stock shim mirrors the
+  host's `_use_prompt_caching` branch and prepared-MoA bypass, dispatching through
+  the request's `agent.context_compressor`, including clones and later engines.
+  Automatic-prefix requests keep the selection's string view; no provider-name
+  detection or automatic-route marking is added. Upstream-seam detection,
+  installation/uninstallation identity checks, and the missing-hook warning
+  remain unchanged.
+
+Provider cache-hit measurements and auxiliary-route cache decoration remain
+unverified host work; local planning tests do not prove turn/compaction reuse.

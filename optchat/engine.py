@@ -40,6 +40,7 @@ except ModuleNotFoundError as exc:
         """Standalone test base when the Hermes package is unavailable."""
 
 from .compactor import CompactionRequest, Compactor, Summarizer
+from .cache import plan_view_cache
 from .media import MEDIA_TYPES, archive_media, has_media_parts
 from .prompts import SYSTEM_PROMPT
 from .store import Log
@@ -512,29 +513,25 @@ class OptChatEngine(ContextEngine):
                 setattr(clone, field, getattr(self, field))
         return clone
 
-
-if hasattr(ContextEngine, "cache_plan"):
-    def _cache_plan(self: OptChatEngine, messages: list[dict[str, Any]],
-                    tools: list[dict[str, Any]], **kwargs: Any) -> Any:
-        # A mismatched tool list breaks the turn cache prefix compaction reuses.
+    def _plan_cache(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]):
+        """Shared seam/shim entry, called only after the host's explicit plan."""
         self._turn_tools = copy.deepcopy(tools)
         self._has_turn_tools = True
         if self.compactor is not None:
             self.compactor.tools = self._turn_tools
+        return plan_view_cache(messages, tools)
+
+
+if hasattr(ContextEngine, "cache_plan"):
+    def _cache_plan(self: OptChatEngine, messages: list[dict[str, Any]],
+                    tools: list[dict[str, Any]], **kwargs: Any) -> Any:
+        sections = self._plan_cache(messages, tools)
+        if sections is None:
+            return None
         try:
-            from agent.prompt_caching import (PromptCachePlan,
-                strip_anthropic_cache_control, strip_anthropic_tool_cache_control)
+            from agent.prompt_caching import PromptCachePlan
         except ImportError:
             return None
-        planned = copy.deepcopy(messages)
-        index = next((i for i, message in enumerate(planned)
-                      if message.get("role") == "assistant"
-                      and _content_text(message.get("content")).startswith("<chat>\n")), None)
-        if index is None:
-            return None
-        strip_anthropic_cache_control(planned)
-        planned[index]["content"] = [{"type": "text", "text": _content_text(planned[index].get("content")),
-                                       "cache_control": {"type": "ephemeral"}}]
-        return PromptCachePlan(planned, strip_anthropic_tool_cache_control(tools))
+        return PromptCachePlan(*sections)
 
     OptChatEngine.cache_plan = _cache_plan

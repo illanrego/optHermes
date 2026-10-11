@@ -1,11 +1,9 @@
 """Interim stock-Hermes cache shim; remove when the upstream cache seam lands.
 
 Stock Hermes strips request cache marks before applying its own plan. This shim
-wraps that pass and marks the single assistant ``<chat>`` view's content after
-the host plan. It leaves the host's request-end breakpoint alone. The assistant
-role keeps the view separate from the changing user turn, so the view remains a
-stable cache prefix. The upstream ``ContextEngine.cache_plan`` seam makes this
-module unnecessary.
+wraps that pass and dispatches through the request's active OptChat engine, using
+the same planner as the seam. The upstream ``ContextEngine.cache_plan`` seam
+makes this module unnecessary.
 """
 
 from __future__ import annotations
@@ -22,36 +20,6 @@ def _warn_missing_once() -> None:
     if not getattr(_warn_missing_once, "warned", False):
         logger.warning("Hermes cache decorator is unavailable; OptChat cache shim is inactive")
         _warn_missing_once.warned = True
-
-
-def _view_text(content: Any) -> str | None:
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list) and content and all(
-        isinstance(part, dict) and part.get("type", "text") == "text"
-        and isinstance(part.get("text"), str) for part in content
-    ):
-        return "".join(part["text"] for part in content)
-    return None
-
-
-def _mark_view(messages: list[dict[str, Any]]) -> None:
-    for message in messages:
-        if not isinstance(message, dict) or message.get("role") != "assistant":
-            continue
-        content = message.get("content")
-        text = _view_text(content)
-        if text is None or not text.startswith("<chat>\n"):
-            continue
-        marker = {"type": "ephemeral"}
-        if isinstance(content, str):
-            message["content"] = [{"type": "text", "text": content,
-                                   "cache_control": marker}]
-        else:
-            parts = list(content)
-            parts[-1] = {**parts[-1], "cache_control": marker}
-            message["content"] = parts
-        return
 
 
 def install(engine: Any) -> None:
@@ -80,10 +48,19 @@ def install(engine: Any) -> None:
     @functools.wraps(original)
     def wrapped(agent: Any, *args: Any, **kwargs: Any) -> Any:
         result = original(agent, *args, **kwargs)
-        if getattr(agent, "context_compressor", None) is engine:
-            messages = result[0] if isinstance(result, tuple) and result else None
-            if isinstance(messages, list):
-                _mark_view(messages)
+        # Mirror the host's branch, including the prepared MoA bypass. This is
+        # its policy decision, not provider detection based on names or marks.
+        prepared = kwargs.get("moa_prepared")
+        if (not getattr(agent, "_use_prompt_caching", False)
+                or prepared is not None and getattr(agent, "provider", None) == "moa"):
+            return result
+        from .engine import OptChatEngine
+        active = getattr(agent, "context_compressor", None)
+        if isinstance(active, OptChatEngine) and isinstance(result, tuple) and len(result) == 3:
+            messages, prepared, tools = result
+            sections = active._plan_cache(messages, tools)
+            if sections is not None:
+                return sections[0], prepared, sections[1]
         return result
 
     wrapped._optchat_cache_shim_original = original  # type: ignore[attr-defined]

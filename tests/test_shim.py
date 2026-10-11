@@ -4,6 +4,9 @@ import logging
 import sys
 import types
 
+import pytest
+
+from optchat.engine import OptChatEngine
 from optchat import shim
 
 
@@ -30,17 +33,20 @@ def test_install_idempotent_and_uninstall_restores_identity(monkeypatch):
         return messages, None, []
 
     loop = _host(monkeypatch, original)
-    engine = object()
-    agent = types.SimpleNamespace(context_compressor=engine)
+    engine = OptChatEngine()
+    agent = types.SimpleNamespace(context_compressor=engine, _use_prompt_caching=True)
     shim.install(engine)
     wrapped = loop._redecorate_prompt_cache_for_provider
     shim.install(engine)
     assert loop._redecorate_prompt_cache_for_provider is wrapped
     result = wrapped(agent, [view, end], system_message="system")
     assert calls == [(agent, "system")]
-    assert result[0][0]["content"] == [{"type": "text", "text": "<chat>\n0+1|x\n</chat>",
-                                        "cache_control": {"type": "ephemeral"}}]
-    assert result[0][1] is end
+    assert result[0][0]["content"] == [
+        {"type": "text", "text": "<chat>\n"},
+        {"type": "text", "text": "0+1|x\n", "cache_control": {"type": "ephemeral"}},
+        {"type": "text", "text": "</chat>"}]
+    assert result[0][1] == end
+    assert isinstance(view["content"], str)
     assert end["content"][0]["cache_control"] == {"type": "ephemeral"}
     shim.uninstall()
     assert loop._redecorate_prompt_cache_for_provider is original
@@ -56,7 +62,7 @@ def test_inactive_engine_does_not_mark(monkeypatch):
     shim.install(object())
     view = {"role": "assistant", "content": "<chat>\nx\n</chat>"}
     loop._redecorate_prompt_cache_for_provider(
-        types.SimpleNamespace(context_compressor=object()), [view])
+        types.SimpleNamespace(context_compressor=object(), _use_prompt_caching=True), [view])
     assert isinstance(view["content"], str)
     shim.uninstall()
 
@@ -82,3 +88,43 @@ def test_missing_private_function_warns_once_and_noops(monkeypatch, caplog):
         shim.install(object())
     assert not hasattr(loop, "_redecorate_prompt_cache_for_provider")
     assert sum("cache decorator is unavailable" in record.message for record in caplog.records) == 1
+
+
+def test_current_engine_replaces_install_time_engine(monkeypatch):
+    tools = [{"type": "function", "function": {"name": "current_tool"}}]
+
+    def original(_agent, messages):
+        return messages, None, tools
+
+    loop = _host(monkeypatch, original)
+    installed, current = OptChatEngine(), OptChatEngine()
+    shim.install(installed)
+    agent = types.SimpleNamespace(context_compressor=current, _use_prompt_caching=True)
+    result = loop._redecorate_prompt_cache_for_provider(
+        agent, [{"role": "assistant", "content": "<chat>\n0+1|second session\n</chat>"},
+                {"role": "user", "content": "now"}])
+    assert "cache_control" in result[0][0]["content"][-2]
+    assert current._turn_tools == tools
+    assert current._has_turn_tools
+    assert not installed._has_turn_tools
+    shim.uninstall()
+
+
+@pytest.mark.parametrize("cache_on, prepared, provider", [
+    (False, None, "automatic"), (True, {}, "moa"),
+])
+def test_host_policy_bypass_keeps_string_view(monkeypatch, cache_on, prepared, provider):
+    def original(_agent, messages, **kwargs):
+        return messages, kwargs.get("moa_prepared"), []
+
+    loop = _host(monkeypatch, original)
+    engine = OptChatEngine()
+    shim.install(engine)
+    agent = types.SimpleNamespace(context_compressor=engine, _use_prompt_caching=cache_on,
+                                  provider=provider)
+    view = {"role": "assistant", "content": "<chat>\n0+1|x\n</chat>"}
+    result = loop._redecorate_prompt_cache_for_provider(agent, [view], moa_prepared=prepared)
+    assert result == ([view], prepared, [])
+    assert isinstance(result[0][0]["content"], str)
+    assert not engine._has_turn_tools
+    shim.uninstall()

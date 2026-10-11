@@ -35,11 +35,61 @@ def cache_engine_class(monkeypatch):
     base.ContextEngine = type("ContextEngine", (), {"cache_plan": lambda self: None})
     monkeypatch.setitem(sys.modules, "agent", agent)
     monkeypatch.setitem(sys.modules, "agent.context_engine", base)
+    caching = types.ModuleType("agent.prompt_caching")
+    caching.PromptCachePlan = lambda messages, tools: types.SimpleNamespace(
+        messages=messages, tools=tools)
+    monkeypatch.setitem(sys.modules, "agent.prompt_caching", caching)
     spec = importlib.util.spec_from_file_location(
         "optchat._engine_with_cache_seam", Path(__file__).parents[1] / "optchat" / "engine.py")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module.OptChatEngine
+
+
+def test_seam_without_view_returns_none(cache_engine_class):
+    engine = cache_engine_class()
+    assert engine.cache_plan([{"role": "user", "content": "now"}], []) is None
+
+
+@pytest.mark.parametrize("native", [False, True])
+def test_shim_and_seam_produce_identical_plan(monkeypatch, cache_engine_class, native):
+    from optchat import shim
+
+    marker = {"type": "ephemeral", "ttl": "1h"}
+    tools = [{"function": {"name": "host_tool"}}]
+    system = [{"type": "text", "text": "static", "cache_control": marker},
+              {"type": "text", "text": "runtime"}]
+    if native:
+        tools[0]["cache_control"] = marker
+    else:
+        system[-1]["cache_control"] = marker
+    messages = [{"role": "system", "content": system},
+                {"role": "assistant", "content": "<chat>\n0+1|history\n1+1|more\n</chat>"},
+                {"role": "user", "content": [{"type": "text", "text": "task",
+                                                 "cache_control": marker}]},
+                {"role": "assistant", "content": [{"type": "text", "text": "reply",
+                                                      "cache_control": marker}]}]
+    seam_engine = cache_engine_class()
+    seam = seam_engine.cache_plan(messages, tools)
+    assert seam.messages[0] == messages[0]
+    assert seam.tools == tools
+
+    # Remove the host ABC hook to exercise the stock installation path.
+    del sys.modules["agent.context_engine"].ContextEngine.cache_plan
+    loop = types.ModuleType("agent.conversation_loop")
+    prepared = {"host": "state"}
+    loop._redecorate_prompt_cache_for_provider = lambda _agent, _messages: (
+        messages, prepared, tools)
+    monkeypatch.setitem(sys.modules, "agent.conversation_loop", loop)
+    sys.modules["agent"].conversation_loop = loop
+    shim.install(OptChatEngine())
+    active = OptChatEngine()
+    agent = types.SimpleNamespace(context_compressor=active, _use_prompt_caching=True)
+    shimmed = loop._redecorate_prompt_cache_for_provider(agent, messages)
+    assert shimmed == (seam.messages, prepared, seam.tools)
+    assert shimmed[1] is prepared
+    assert active._turn_tools == seam_engine._turn_tools
+    shim.uninstall()
 
 
 @pytest.mark.parametrize("capture_before_start", [False, True])
