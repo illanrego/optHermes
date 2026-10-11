@@ -19,17 +19,13 @@ Where it stands:
   feat/context-engine-seams (commit cf1743d63a): tools to select_context, ContextSelectionBlocked,
   and on_message. They are NOT merged into any running host, and there are NO PRs - the user's rule
   is that nothing goes upstream until he has tested it on his terms.
-- The engine repo has branch feat/plan-order1 carrying Order 1 of the plan (four fixes: loud
-  semantic corruption with no id reuse, non-writing foreign readers, view recovery independent of
-  root construction, explicit missing-view-state).
+- Orders 1 and 4 of the plan are **DONE and merged to main** (Order 1: 07d5fa8 → f548c0d; Order 4:
+  0fa9f67 plus the host gate 81af99c011 in the seam worktree). Their worktrees are removed and
+  nothing is in flight. Main is at 57332b7 with 225 tests green.
 
 FIRST, check that state:
 
-  cd ~/Documents/coding/opthermes && git log --oneline -6 && git status --short && git branch
-
-If Order 1's work is uncommitted, verify it before committing: read the diff, run the suite
-(`~/.hermes/tools/uv-*/uv run --no-project --with pytest python -m pytest -q`), and confirm the new
-tests fail without the fix. Then commit per-step on that branch and merge it to main.
+  cd ~/Documents/coding/opthermes && git log --oneline -6 && git status --short && git worktree list
 
 What is next, in the plan's order:
 
