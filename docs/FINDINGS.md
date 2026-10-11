@@ -30,7 +30,7 @@ The plan's orders (`docs/PLAN-next.md`, revision 2) run on top of these:
 | Order | items | subject | status |
 |---|---|---|---|
 | Order 1 | P1c, P6a, P1a, P3b | loud corruption with no id reuse, non-writing foreign readers, view recovery independent of roots, explicit missing-view state | DONE (07d5fa8, merged f548c0d) |
-| Order 4 | P6b, #16, acceptance test | truthful, usable retrieval | RUNNING |
+| Order 4 | P6b, #16, acceptance test | truthful, usable retrieval | DONE (0fa9f67 engine, host gate in the seam worktree) |
 | Order 0 | D1-D5 | the decisions: target host, `message_uid` identity, the frozen view, the recovery protocol, missing-view policy | held for Codex's reset |
 | Order 2 | P1b, P1d | the durability protocol | held (needs D4) |
 | Order 3 | P2a, P3a | the turn boundary by UID, and the frozen served view | held (needs D2/D3) |
