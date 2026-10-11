@@ -23,7 +23,7 @@ def mark_positions(messages, tools):
     return positions
 
 
-def host_request(*, tool_prefix=False, lines=2):
+def host_request(*, tool_prefix=False, lines=4):
     system = [marked("static")]
     system.append({"type": "text", "text": "runtime"} if tool_prefix else marked("runtime"))
     tools = [{"type": "function", "function": {"name": "lookup"}}]
@@ -43,21 +43,22 @@ def test_host_prefixes_survive_with_same_ttl_and_no_input_mutation(tool_prefix):
     assert planned[0] == messages[0]
     assert planned_tools == tools
     assert len(mark_positions(planned, planned_tools)) == 4
-    assert planned[1]["content"][-2] == marked("1+1|line 1\n")
+    assert planned[1]["content"][-2] == marked(
+        "".join(f"{i}+1|line {i}\n" for i in range(4)))
     assert planned[1]["content"][-1] == {"type": "text", "text": "</chat>"}
     assert planned[-1] == messages[-1]
     assert (messages, tools) == before
 
 
 def test_growth_keeps_old_marked_boundary_at_same_block_position():
-    previous, _ = plan_view_cache(*host_request(lines=250))
-    grown, _ = plan_view_cache(*host_request(lines=251))
+    previous, _ = plan_view_cache(*host_request(lines=251))
+    grown, _ = plan_view_cache(*host_request(lines=252))
     old_blocks, new_blocks = previous[1]["content"], grown[1]["content"]
     old_mark = next(i for i, block in enumerate(old_blocks) if "cache_control" in block)
-    assert old_mark == 250
+    assert old_mark == 62
     assert "cache_control" in new_blocks[old_mark + 1]
-    assert [{k: v for k, v in block.items() if k != "cache_control"}
-            for block in old_blocks[:old_mark + 1]] == new_blocks[:old_mark + 1]
+    assert [block["text"] for block in old_blocks[:old_mark + 1]] == [
+        block["text"] for block in new_blocks[:old_mark + 1]]
     assert new_blocks[old_mark]["text"] == old_blocks[old_mark]["text"]
     # The old checkpoint remains in the new breakpoint's lookback window.
     assert len(new_blocks) - 2 - old_mark < 20
@@ -70,7 +71,36 @@ def test_unicode_text_is_preserved_and_replanning_is_idempotent():
     planned, planned_tools = plan_view_cache(messages, tools)
     assert "".join(part["text"] for part in planned[1]["content"]) == text
     assert len(planned[1]["content"]) == 3
+    assert all("cache_control" not in part for part in planned[1]["content"])
     assert plan_view_cache(planned, planned_tools) == (planned, planned_tools)
+
+
+def test_four_lines_mark_the_single_complete_group():
+    planned, _ = plan_view_cache(*host_request(lines=4))
+    blocks = planned[1]["content"]
+    assert len(blocks) == 3
+    assert blocks[0] == {"type": "text", "text": "<chat>\n"}
+    assert blocks[1] == marked("".join(f"{i}+1|line {i}\n" for i in range(4)))
+    assert blocks[2] == {"type": "text", "text": "</chat>"}
+
+
+def test_seven_lines_mark_complete_group_not_partial_tail():
+    planned, _ = plan_view_cache(*host_request(lines=7))
+    blocks = planned[1]["content"]
+    assert len(blocks) == 4
+    assert blocks[1] == marked("".join(f"{i}+1|line {i}\n" for i in range(4)))
+    assert blocks[2] == {"type": "text", "text": "".join(
+        f"{i}+1|line {i}\n" for i in range(4, 7))}
+    assert blocks[3] == {"type": "text", "text": "</chat>"}
+
+
+def test_five_lines_keep_four_line_boundary_unchanged():
+    previous, _ = plan_view_cache(*host_request(lines=4))
+    grown, _ = plan_view_cache(*host_request(lines=5))
+    old_blocks, new_blocks = previous[1]["content"], grown[1]["content"]
+    assert old_blocks[1] == new_blocks[1]
+    assert new_blocks[2] == {"type": "text", "text": "4+1|line 4\n"}
+    assert new_blocks[3] == {"type": "text", "text": "</chat>"}
 
 
 @pytest.mark.parametrize("extra_marks", [0, 1, 2, 8, 30])
@@ -151,6 +181,6 @@ def test_empty_view_has_no_complete_line_mark():
 def test_undecorated_request_and_view_only_request():
     view = {"role": "assistant", "content": "<chat>\n0+1|x\n</chat>"}
     planned, _ = plan_view_cache([view, {"role": "user", "content": "now"}], [])
-    assert mark_positions(planned, []) == [(0, 1), (1, 0)]
+    assert mark_positions(planned, []) == [(1, 0)]
     planned, _ = plan_view_cache([view], [])
-    assert mark_positions(planned, []) == [(0, 1), (0, 2)]
+    assert mark_positions(planned, []) == [(0, 2)]

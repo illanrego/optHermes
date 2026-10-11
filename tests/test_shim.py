@@ -24,7 +24,8 @@ def _host(monkeypatch, original=None):
 
 def test_install_idempotent_and_uninstall_restores_identity(monkeypatch):
     calls = []
-    view = {"role": "assistant", "content": "<chat>\n0+1|x\n</chat>"}
+    view = {"role": "assistant",
+            "content": "<chat>\n" + "".join(f"{i}+1|line {i}\n" for i in range(4)) + "</chat>"}
     end = {"role": "user", "content": [{"type": "text", "text": "now",
                                         "cache_control": {"type": "ephemeral"}}]}
 
@@ -43,7 +44,8 @@ def test_install_idempotent_and_uninstall_restores_identity(monkeypatch):
     assert calls == [(agent, "system")]
     assert result[0][0]["content"] == [
         {"type": "text", "text": "<chat>\n"},
-        {"type": "text", "text": "0+1|x\n", "cache_control": {"type": "ephemeral"}},
+        {"type": "text", "text": "0+1|line 0\n1+1|line 1\n2+1|line 2\n3+1|line 3\n",
+         "cache_control": {"type": "ephemeral"}},
         {"type": "text", "text": "</chat>"}]
     assert result[0][1] == end
     assert isinstance(view["content"], str)
@@ -101,7 +103,9 @@ def test_current_engine_replaces_install_time_engine(monkeypatch):
     shim.install(installed)
     agent = types.SimpleNamespace(context_compressor=current, _use_prompt_caching=True)
     result = loop._redecorate_prompt_cache_for_provider(
-        agent, [{"role": "assistant", "content": "<chat>\n0+1|second session\n</chat>"},
+        agent, [{"role": "assistant",
+                 "content": "<chat>\n" + "".join(f"{i}+1|line {i}\n" for i in range(4))
+                            + "</chat>"},
                 {"role": "user", "content": "now"}])
     assert "cache_control" in result[0][0]["content"][-2]
     assert current._turn_tools == tools

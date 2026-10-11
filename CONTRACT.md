@@ -444,11 +444,12 @@ still leave a live placeholder; host fail-closed admission remains outside WP4.
   planner. It returns copied `(messages, tools)` sections or `None`; it never
   changes stored messages, the persisted view, or the caller's plan. The engine's
   `_plan_cache` captures outgoing tools before calling it, for both integrations.
-- The request view is split into an opening-tag block, one block per complete
-  newline-terminated line, and a closing-tag block. The last complete line gets
-  a breakpoint; appending lines preserves the previous blocks and boundaries.
-  The closing tag is excluded from that reusable prefix. A merge or a changed
-  placeholder invalidates the affected prefix as before.
+- The request view is split into an opening-tag block, one block per group of
+  four complete newline-terminated lines, and a closing-tag block. The last
+  complete group gets a breakpoint, so that boundary stays byte-identical until
+  another group fills; appending lines preserves the previous blocks and
+  boundaries. The closing tag is excluded from that reusable prefix. A merge or
+  a changed placeholder invalidates the affected prefix as before.
 - The planner retains or adds a request-end mark at the last legal cacheable
   message. Tool-result eligibility and top-level versus part placement come from
   the host's existing marks. System/tools marks are protected; excess conversation

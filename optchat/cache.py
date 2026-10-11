@@ -49,10 +49,11 @@ def plan_view_cache(messages: list[dict[str, Any]], tools: list[dict[str, Any]])
 ):
     """Preserve prefix marks; budget complete-view and host-legal end marks.
 
-    Each newline-terminated view line is a complete block. The opening tag has
-    its own block; the closing tag is a separate, unmarked tail. Appending lines
-    leaves every preceding block and boundary byte-identical. Merges naturally
-    invalidate the affected prefix. No persisted view or transcript is changed.
+    The opening and closing tags have separate blocks. View lines are grouped
+    four at a time, with a possibly partial final group. Only the last complete
+    group is marked, so appending lines keeps that boundary byte-identical until
+    another group is complete. Merges naturally invalidate the affected prefix.
+    No persisted view or transcript is changed.
 
     System/tool markers (including TTLs) are protected. Only excess conversation
     markers are evicted, oldest first. The host has at most two prefix markers
@@ -80,8 +81,10 @@ def plan_view_cache(messages: list[dict[str, Any]], tools: list[dict[str, Any]])
     assert text is not None
     # Split on literal LF, matching View.render (Unicode line separators are
     # ordinary summary text). Keep delimiters so concatenation is byte-exact.
-    blocks = [{"type": "text", "text": line + "\n"}
-              for line in text[:-len("</chat>")].split("\n")[:-1]]
+    lines = [line + "\n" for line in text[len("<chat>\n"):-len("</chat>")].split("\n")[:-1]]
+    blocks = [{"type": "text", "text": "<chat>\n"}]
+    blocks.extend({"type": "text", "text": "".join(lines[i:i + 4])}
+                  for i in range(0, len(lines), 4))
     blocks.append({"type": "text", "text": "</chat>"})
     view.pop("cache_control", None)
     view["content"] = blocks
@@ -125,8 +128,8 @@ def plan_view_cache(messages: list[dict[str, Any]], tools: list[dict[str, Any]])
     # on a view boundary more than 19 block positions behind the request end.
     trailing = 1 + sum(_block_count(message) for message in planned[index + 1:])
     view_site = None
-    if len(blocks) > 2 and trailing < LOOKBACK_BLOCKS:
-        view_site = blocks[-2]
+    if len(lines) >= 4 and trailing < LOOKBACK_BLOCKS:
+        view_site = blocks[len(lines) // 4]
         view_site["cache_control"] = copy.deepcopy(marker)
 
     sites = [site for message in planned if message.get("role") != "system"
