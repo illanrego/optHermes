@@ -24,6 +24,16 @@ result's name-to-child mapping is registered as soon as the result is visible to
 a selection of the running turn, not only at ``on_turn_complete``; a name already
 mapped to a different child keeps its first mapping and warns once.
 
+The host's runtime block (date, session id, model, platform) is moved out of the
+system text and re-delivered verbatim on the user channel after the view, so the
+system text stays byte-stable across sessions; the host's own markers define the
+block, and a host without them is left untouched.
+
+``optchat_zoom(id, 1)`` returns its media in the host's multimodal envelope where
+the host recognises one, resolving archived image references to inline data URLs;
+a host without the envelope keeps today's JSON string. Media never enters the view
+or a compaction prompt either way.
+
 The host ABC is imported here, rather than by the package entry point. When
 Hermes is absent, a local base permits standalone unit tests; an engine loaded
 inside Hermes inherits the real ABC. This binding is fixed at module import.
@@ -112,6 +122,61 @@ def _content_text(content: Any) -> str:
     return "" if content is None else str(content)
 
 
+def _runtime_markers() -> tuple[str, str] | None:
+    """The host's own runtime-block delimiters, or ``None`` when it defines none.
+
+    The host renders the block (date, session id, model, platform) between these
+    markers at the end of its system prompt. They are read from the host itself
+    (``agent.prompt_builder``), never re-derived here; a host without them gets
+    today's behaviour, and nothing moves.
+    """
+    try:
+        from agent.prompt_builder import RUNTIME_ENVIRONMENT_END, RUNTIME_ENVIRONMENT_HEADING
+    except Exception:
+        return None
+    if not RUNTIME_ENVIRONMENT_HEADING or not RUNTIME_ENVIRONMENT_END:
+        return None
+    return RUNTIME_ENVIRONMENT_HEADING, RUNTIME_ENVIRONMENT_END
+
+
+def _split_runtime_block(content: str) -> tuple[str, str | None]:
+    """Lift the host's runtime block out of a system text: ``(stripped, block)``.
+
+    The block is ``{heading}\\n\\n{hints}\\n\\n{end}``, the host renderer's own
+    shape; only the marker-delimited block moves and the rest is returned byte
+    for byte. ``(content, None)`` when the host defines no markers or the text
+    carries no such block.
+    """
+    markers = _runtime_markers()
+    if not content or markers is None:
+        return content, None
+    heading, end = markers
+    start = content.rfind(f"\n\n{heading}\n\n")
+    if start < 0:
+        return content, None
+    stop = content.find(f"\n\n{end}", start)
+    if stop < 0:
+        return content, None
+    stop += 2 + len(end)
+    return content[:start] + content[stop:], content[start + 2:stop]
+
+
+def _multimodal_envelope_supported() -> bool:
+    """Whether this host recognises the ``_multimodal`` tool-result envelope.
+
+    The host's own predicate (``agent.tool_dispatch_helpers._is_multimodal_tool_result``)
+    is the marker: where it exists, a tool result carrying ``_multimodal=True`` and
+    a content list is turned into real multimodal content (persisted; downgraded to
+    its text summary for text-only models). Where it does not, tools keep returning
+    plain JSON strings.
+    """
+    try:
+        from agent.tool_dispatch_helpers import _is_multimodal_tool_result
+    except Exception:
+        return False
+    return callable(_is_multimodal_tool_result)
+
+
 def _delegate_name(text: str) -> str:
     """Use a named JSON result when available, otherwise label the child generically.
 
@@ -161,6 +226,7 @@ class OptChatEngine(ContextEngine):
         self._session_id = ""
         self._warned_ingest_boundary = False
         self._warned_child_conflicts: set[str] = set()
+        self._start_failure_logged = False
         # Delegate results already seen by a selection of the running turn, keyed
         # by row fingerprint: ``_arrived_rows`` guards against re-resolving a row,
         # ``_arrived_records`` carries its resolution to ingestion.
@@ -180,6 +246,20 @@ class OptChatEngine(ContextEngine):
         return "optchat"
 
     def on_session_start(self, session_id: str, **kwargs: Any) -> None:
+        try:
+            self._start_session(session_id, **kwargs)
+        except Exception as exc:
+            # The host catches this and logs at debug level, so the failure must be
+            # loud here: the session then runs without OptChat and its guarantee.
+            if not self._start_failure_logged:
+                self._start_failure_logged = True
+                logger.error(
+                    "OptChat failed to start for session %s: %s. OptChat is not active "
+                    "for this session: no view is served and nothing is folded, and the "
+                    "no-loss guarantee is not in effect.", session_id, exc)
+            raise
+
+    def _start_session(self, session_id: str, **kwargs: Any) -> None:
         self._session_id = session_id
         if "model" in kwargs:
             self._turn_model = kwargs["model"]
@@ -356,12 +436,21 @@ class OptChatEngine(ContextEngine):
             return None
         system = [copy.deepcopy(message) for message in request_messages
                   if message.get("role") == "system"]
+        runtime_block: str | None = None
         if not system:
             system = [{"role": "system", "content": SYSTEM_PROMPT}]
         else:
-            content = _content_text(system[0].get("content"))
+            original = _content_text(system[0].get("content"))
+            # The host's runtime block (date, session id, model, platform) is state,
+            # and state never belongs in the system prompt: the system text must stay
+            # byte-stable across sessions for the stable prefix to be stable. Move
+            # the block verbatim to the user channel after the view; everything else
+            # in the system text stays byte for byte.
+            content, runtime_block = _split_runtime_block(original)
             if SYSTEM_PROMPT not in content:
-                system[0]["content"] = content + "\n\n" + SYSTEM_PROMPT
+                content = content + "\n\n" + SYSTEM_PROMPT
+            if content != original:
+                system[0]["content"] = content
         turn = [copy.deepcopy(message) for message in request_messages[turn_start:]]
         _, tree, view, compactor = self._open()
         # A delegate result is visible in the running turn's request before the
@@ -388,8 +477,13 @@ class OptChatEngine(ContextEngine):
         except Exception:
             logger.exception("OptChat settle failed; serving the current view")
         logger.debug("OptChat settle built %d nodes; view settled: %s", built, view.settled())
+        # The runtime block travels where the design puts per-turn state: after the
+        # view and before this turn's messages (the host merges it into the turn's
+        # first user row, exactly as it delivers its own per-turn notes).
+        runtime = ([{"role": "user", "content": runtime_block}]
+                   if runtime_block is not None else [])
         return system + [{"role": "assistant", "content": (
-            self._master_view or view).render()}] + turn
+            self._master_view or view).render()}] + runtime + turn
 
     def get_tool_schemas(self) -> list[dict[str, Any]]:
         integer = {"type": "integer"}
@@ -463,6 +557,9 @@ class OptChatEngine(ContextEngine):
         if scope is not None and (not isinstance(scope, str) or not scope):
             return json.dumps({"error": "scope must be a nonempty subagent name"})
         if name == "optchat_zoom":
+            # The host's envelope is only used where the host itself recognises it;
+            # everywhere else the tool keeps returning today's JSON string.
+            envelope = _multimodal_envelope_supported()
             if scope is not None:
                 if isinstance(args.get("id"), str):
                     return json.dumps({"error": "a string id opens its own chat; "
@@ -472,10 +569,10 @@ class OptChatEngine(ContextEngine):
                     return child
                 child_log, child_tree = child
                 return opt_tools.zoom(child_log, child_tree, None, args.get("id"),
-                                      args.get("n", 1), scope=scope)
+                                      args.get("n", 1), scope=scope, envelope=envelope)
             log, tree, view = self._reading_scope()
             return opt_tools.zoom(log, tree, view, args.get("id"), args.get("n", 1),
-                                  master_root=self.root)
+                                  master_root=self.root, envelope=envelope)
         if name == "optchat_date":
             if scope is not None:
                 child = self._child_scope(scope)

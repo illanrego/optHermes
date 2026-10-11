@@ -3,8 +3,13 @@
 import base64
 import json
 import logging
+import sys
+import types
 
 from optchat import OptChatEngine
+from optchat.store import Log
+from optchat.tools import zoom
+from optchat.tree import Tree
 
 
 class RecordingSummarizer:
@@ -107,3 +112,123 @@ def test_input_image_and_input_audio_shapes_do_not_leak_media_text(tmp_path):
     ]
     assert [(tmp_path / entry["path"]).read_bytes() for entry in result["media"]] == [
         b"picture", b"voice"]
+
+
+def _multimodal_host(monkeypatch):
+    """Install the host's envelope predicate so the engine sees a supporting host."""
+    agent = types.ModuleType("agent")
+    agent.__path__ = []
+    helpers = types.ModuleType("agent.tool_dispatch_helpers")
+    helpers._is_multimodal_tool_result = lambda value: (
+        isinstance(value, dict) and value.get("_multimodal") is True
+        and isinstance(value.get("content"), list))
+    monkeypatch.setitem(sys.modules, "agent", agent)
+    monkeypatch.setitem(sys.modules, "agent.tool_dispatch_helpers", helpers)
+
+
+def test_zoom_uses_the_host_envelope_when_supported(tmp_path, monkeypatch):
+    _multimodal_host(monkeypatch)
+    engine = OptChatEngine(tmp_path, summarize=RecordingSummarizer())
+    image = b"envelope image bytes"
+    engine.on_turn_complete([{"role": "user", "content": [
+        {"type": "text", "text": "Describe this"}, _image(image)]}])
+
+    result = engine.handle_tool_call("optchat_zoom", {"id": 0, "n": 1})
+
+    assert result["_multimodal"] is True
+    text_part, image_part = result["content"]
+    assert text_part == {"type": "text", "text": result["text_summary"]}
+    # The text channel is today's JSON payload, byte for byte.
+    assert json.loads(result["text_summary"]) == {
+        "id": 0, "n": 1, "kind": "user", "scope": None, "text": "Describe this",
+        "media": [{"path": "assets/0-1.png", "type": "image"}]}
+    assert image_part["type"] == "image_url"
+    url = image_part["image_url"]["url"]
+    assert url.startswith("data:image/png;base64,")
+    assert base64.b64decode(url.split(",", 1)[1]) == image
+
+
+def test_envelope_is_only_for_messages_with_media(tmp_path, monkeypatch):
+    _multimodal_host(monkeypatch)
+    engine = OptChatEngine(tmp_path, summarize=RecordingSummarizer())
+    engine.on_turn_complete([{"role": "user", "content": "no media here"}])
+
+    result = engine.handle_tool_call("optchat_zoom", {"id": 0, "n": 1})
+
+    assert isinstance(result, str)
+    assert json.loads(result)["media"] == []
+
+
+def test_envelope_keeps_audio_and_file_references_in_the_json(tmp_path, monkeypatch):
+    _multimodal_host(monkeypatch)
+    local = tmp_path / "source.pdf"
+    local.write_bytes(b"%PDF-sample")
+    engine = OptChatEngine(tmp_path, summarize=RecordingSummarizer())
+    engine.on_turn_complete([{"role": "user", "content": [
+        {"type": "audio", "data": base64.b64encode(b"sound").decode(),
+         "mime_type": "audio/wav"},
+        {"type": "file", "path": str(local), "mime_type": "application/pdf"},
+        _image(b"picture")]}])
+
+    result = engine.handle_tool_call("optchat_zoom", {"id": 0, "n": 1})
+
+    assert result["_multimodal"] is True
+    payload = json.loads(result["text_summary"])
+    assert [entry["type"] for entry in payload["media"]] == ["audio", "file", "image"]
+    assert len(result["content"]) == 2  # the JSON text part and the one image part
+    assert result["content"][1]["image_url"]["url"].startswith("data:image/png;base64,")
+
+
+def test_envelope_passes_a_remote_reference_through(tmp_path):
+    with Log(tmp_path) as log:
+        tree = Tree(tmp_path)
+        index = log.append("user", "remote picture")
+        (tmp_path / "assets").mkdir()
+        (tmp_path / "assets" / "index.json").write_text(json.dumps({
+            "0": [{"path": "https://example.invalid/picture.png", "type": "image"}]}),
+            encoding="utf-8")
+        result = zoom(log, tree, None, index, 1, envelope=True)
+
+    assert result["_multimodal"] is True
+    assert result["content"][1] == {
+        "type": "image_url", "image_url": {"url": "https://example.invalid/picture.png"}}
+
+
+def test_envelope_skips_unresolvable_references(tmp_path):
+    with Log(tmp_path) as log:
+        tree = Tree(tmp_path)
+        index = log.append("user", "lost picture")
+        (tmp_path / "assets").mkdir()
+        (tmp_path / "assets" / "index.json").write_text(json.dumps({
+            "0": [{"path": "assets/0-0.png", "type": "image"}]}), encoding="utf-8")
+        result = zoom(log, tree, None, index, 1, envelope=True)
+
+    # Nothing to attach: today's JSON string, references intact.
+    assert isinstance(result, str)
+    assert json.loads(result)["media"] == [{"path": "assets/0-0.png", "type": "image"}]
+
+
+def test_envelope_media_still_never_enters_log_view_or_compaction(tmp_path, monkeypatch):
+    _multimodal_host(monkeypatch)
+    summarizer = RecordingSummarizer()
+    engine = OptChatEngine(tmp_path, node_bytes=32, summarize=summarizer)
+    image = b"round trip image"
+    message = {"role": "user", "content": [
+        {"type": "text", "text": "Describe this"}, _image(image)]}
+    engine.on_turn_complete([message])
+
+    result = engine.handle_tool_call("optchat_zoom", {"id": 0, "n": 1})
+    # The host stores the envelope's content list as the tool message; ingest it.
+    engine.on_turn_complete([
+        message,
+        {"role": "assistant", "content": None, "tool_calls": [
+            {"id": "call-1", "function": {"name": "optchat_zoom", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "call-1", "content": result["content"]}])
+
+    encoded = base64.b64encode(image).decode("ascii")
+    assert engine.log.count() == 3
+    assert all(encoded not in record.text
+               for record in engine.log.range(0, engine.log.count() - 1))
+    assert encoded not in engine.view.render()
+    assert all(encoded not in request.task and encoded not in request.context
+               for request in summarizer.requests)

@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from .media import media_for
+from .media import envelope_media_parts, media_for
 from .store import Log
 from .tree import Tree
 from .view import View
@@ -33,7 +33,8 @@ def child_chat_root(root: Path, name: object) -> Path | None:
 
 
 def zoom(log: Log, tree: Tree, view: View | None, id: int | str, n: int = 1,
-         *, scope: str | None = None, master_root: Path | None = None) -> str:
+         *, scope: str | None = None, master_root: Path | None = None,
+         envelope: bool = False) -> str | dict:
     """Open a child chat, a named span, or a raw message.
 
     ``scope`` names the chat the ids belong to: ``None`` for the log this call was
@@ -41,6 +42,12 @@ def zoom(log: Log, tree: Tree, view: View | None, id: int | str, n: int = 1,
     and validates a scope before calling; here it only labels the payload, so the
     caller can open a line in the same scope again. ``view`` is unused by the
     span and message paths and may be ``None``.
+
+    ``envelope`` asks for the host's multimodal tool-result envelope on the raw
+    message path when the message has archived images: the same JSON payload as
+    the text part (and the text summary), plus one image part per resolvable
+    archive reference. Without it - or without images - the JSON string is
+    returned unchanged.
     """
     if isinstance(id, str):
         root = Path(master_root) if master_root is not None else log.root
@@ -65,9 +72,16 @@ def zoom(log: Log, tree: Tree, view: View | None, id: int | str, n: int = 1,
         record = log.get(id)
         if record is None:
             return _error("message does not exist")
-        return json.dumps({"id": id, "n": 1, "kind": record.kind, "scope": scope,
-                           "text": record.text, "media": media_for(log.root, id)},
-                          ensure_ascii=False)
+        payload = {"id": id, "n": 1, "kind": record.kind, "scope": scope,
+                   "text": record.text, "media": media_for(log.root, id)}
+        text = json.dumps(payload, ensure_ascii=False)
+        if envelope:
+            parts = envelope_media_parts(log.root, id)
+            if parts:
+                return {"_multimodal": True,
+                        "content": [{"type": "text", "text": text}, *parts],
+                        "text_summary": text}
+        return text
 
     # A named node covers [id, id+n). Both children must have been built.
     if id + n > log.count():

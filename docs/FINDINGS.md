@@ -153,7 +153,15 @@ Still upstream, not built:
   a turn's plan even with identical intent.
 - **Child identity in results (#15, host half)** include the child session id in every completed
   result entry.
-- **The multimodal envelope (#17, host half)** let engine tools return media.
+- **The multimodal envelope (#17, host half)** let engine tools return media. As of this host the
+  executor path already accepts the `_multimodal` envelope from an engine tool (the engine now
+  uses it); what remains host-side is the `ContextEngine.handle_tool_call` docstring, which still
+  says it must return a JSON string.
+- **The silent fallback (#20, host half)** an engine that fails to import, register or start is
+  logged at debug level and the session continues on the built-in compressor, so the guarantee
+  disappears with no user-visible signal. The host should surface the fallback (a warning or a
+  status line) or fail closed when `context.engine` names an engine that cannot load. OptChat now
+  names its own failures loudly, but the host's messages remain the last word.
 
 ## The verification milestone
 

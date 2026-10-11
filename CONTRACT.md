@@ -576,3 +576,49 @@ Known and accepted: `terminal`, `file` and `code_execution` remain, and the log 
 that means removing the shell, which would gut the body Hermes is kept for. It is accepted because it
 takes a deliberate act rather than an offered, discoverable tool - and it is recorded here rather
 than left as a footnote.
+
+---
+
+# Revision 10 - the runtime block moves; media rides the envelope (2026-10-11)
+
+WP8. Two documented interfaces change, and registration/startup failures become loud.
+
+## The system prompt carries no state
+
+`select_context` now lifts the host's runtime block (date, session id, model, platform) out of the
+system message and returns it verbatim as a `user` message **after the view and before this turn's
+messages**, so the system text is byte-stable across sessions and the stable prefix a compaction
+reads is stable. The block is the host's own marker-delimited render
+(`RUNTIME_ENVIRONMENT_HEADING` / `RUNTIME_ENVIRONMENT_END`, read from `agent.prompt_builder`); only
+that block moves and the rest of the system text is byte for byte. A host without the markers, or a
+text without the block, is unchanged. The host's merge pass folds the relocated message into the
+turn's first user row, exactly as it delivers its own per-turn notes.
+
+Return shape: `[system] [assistant: <chat> view] [user: runtime block] [user: this turn's
+messages]` when the block is present; `[system] [assistant: <chat> view] [turn]` otherwise.
+
+## Media rides the host's multimodal envelope
+
+`optchat_zoom(id, 1)` returns the host's multimodal tool-result envelope where the host recognises
+it (`agent.tool_dispatch_helpers._is_multimodal_tool_result`):
+
+```json
+{"_multimodal": true,
+ "content": [{"type": "text", "text": <today's JSON payload>},
+             {"type": "image_url", "image_url": {"url": <data: URL or remote URL>}}],
+ "text_summary": <today's JSON payload>}
+```
+
+The text part and the summary are today's JSON payload exactly, and each archived image reference is
+resolved to an `image_url` part: a local reference becomes an inline data URL, an http(s) reference
+is passed through (the provider owns remote-URL validation). Audio and file entries stay in the JSON;
+their part shapes are not demonstrated for tool results. Where the host has no such predicate, and
+on every path without images, the return is today's JSON string. `handle_tool_call` therefore
+returns `str | dict`. Media still never enters the view or a compaction prompt.
+
+## Loud failure
+
+Every registration/startup failure path logs one clear error line naming the lost guarantee
+("OptChat is not active: ... the host will ... compress it lossily ..."); `on_session_start` logs
+once per engine and re-raises. The host's silent fallback to its built-in compressor is unchanged -
+it is an upstream ask (docs/FINDINGS.md).

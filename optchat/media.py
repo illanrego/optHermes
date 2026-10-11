@@ -156,3 +156,48 @@ def media_for(root: Path, message_id: int) -> list[dict[str, str]]:
     except (OSError, ValueError, TypeError) as exc:
         logger.warning("Could not read media index for message %d: %s", message_id, exc)
         return []
+
+
+# Reverse of the image half of ``_EXTENSIONS``: an archived file's suffix -> its
+# media type for the envelope's data URL.
+_IMAGE_MIME = {extension: mime for mime, extension in _EXTENSIONS.items()
+               if mime.startswith("image/")}
+
+
+def envelope_media_parts(root: Path, message_id: int) -> list[dict[str, Any]]:
+    """Host-envelope content parts for one message's archived images.
+
+    The host carries images in tool results as ``{"type": "image_url",
+    "image_url": {"url": ...}}`` parts. A local archive reference is resolved to
+    an inline data URL; an http(s) reference is passed through, which the host
+    forwards to the provider as a remote-URL image. Anything else - an unknown
+    suffix, an unreadable or escaping path - is skipped, and its reference in the
+    payload still names it. Only images: the host converts tool-result parts as
+    text and image, so audio and file entries stay references.
+    """
+    root = Path(root)
+    parts: list[dict[str, Any]] = []
+    for entry in media_for(root, message_id):
+        if not isinstance(entry, dict) or entry.get("type") != "image":
+            continue
+        reference = entry.get("path")
+        if not isinstance(reference, str) or not reference:
+            continue
+        if reference.startswith(("http://", "https://")):
+            parts.append({"type": "image_url", "image_url": {"url": reference}})
+            continue
+        mime = _IMAGE_MIME.get(Path(reference).suffix.lower())
+        if mime is None:
+            continue
+        try:
+            path = (root / reference).resolve()
+            path.relative_to(root.resolve())
+            raw = path.read_bytes()
+        except (OSError, ValueError):
+            continue
+        if not raw:
+            continue
+        encoded = base64.b64encode(raw).decode("ascii")
+        parts.append({"type": "image_url",
+                      "image_url": {"url": f"data:{mime};base64,{encoded}"}})
+    return parts

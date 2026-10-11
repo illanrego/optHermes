@@ -787,3 +787,84 @@ def test_unfindable_boundary_ingests_nothing_and_warns(tmp_path):
         restarted.on_turn_complete([{"role": "user", "content": "something else entirely"}])
     assert restarted.log.count() == 1  # nothing guessed, nothing duplicated
     restarted.log.close()
+
+
+RUNTIME_HEADING = "# Hermes runtime environment"
+RUNTIME_END = "<!-- End Hermes runtime environment -->"
+
+
+def _host_runtime_markers(monkeypatch):
+    """Install the host's own marker constants so the engine resolves them."""
+    agent = types.ModuleType("agent")
+    agent.__path__ = []
+    builder = types.ModuleType("agent.prompt_builder")
+    builder.RUNTIME_ENVIRONMENT_HEADING = RUNTIME_HEADING
+    builder.RUNTIME_ENVIRONMENT_END = RUNTIME_END
+    monkeypatch.setitem(sys.modules, "agent", agent)
+    monkeypatch.setitem(sys.modules, "agent.prompt_builder", builder)
+
+
+def test_selection_moves_the_host_runtime_block_after_the_view(tmp_path, monkeypatch):
+    _host_runtime_markers(monkeypatch)
+    engine = OptChatEngine(tmp_path, summarize=FakeSummarizer())
+    engine.on_turn_complete([{"role": "user", "content": "first"}])
+    block = (f"{RUNTIME_HEADING}\n\n"
+             "Session: 2026-10-11; model: m; platform: cli\n\n"
+             f"{RUNTIME_END}")
+    identity = "Host instructions"
+    request = [{"role": "system", "content": identity + "\n\n" + block},
+               {"role": "user", "content": "old question"},
+               {"role": "assistant", "content": "old answer"},
+               {"role": "user", "content": "new question"}]
+
+    selected = engine.select_context(request)
+
+    # Everything but the block stays byte for byte, and the block itself moves
+    # verbatim to the user channel after the view, before this turn's messages.
+    assert selected[0]["content"] == identity + "\n\n" + SYSTEM_PROMPT
+    assert [message["role"] for message in selected] == [
+        "system", "assistant", "user", "user"]
+    assert selected[1]["content"] == engine.view.render()
+    assert selected[2] == {"role": "user", "content": block}
+    assert selected[3:] == request[3:]
+    # The same information, exactly once: relocated, never dropped.
+    assert sum(block in str(message.get("content")) for message in selected) == 1
+    assert request[0]["content"] == identity + "\n\n" + block  # request not mutated
+
+
+def test_selection_moves_the_runtime_block_from_the_middle_too(tmp_path, monkeypatch):
+    _host_runtime_markers(monkeypatch)
+    engine = OptChatEngine(tmp_path, summarize=FakeSummarizer())
+    block = f"{RUNTIME_HEADING}\n\nHost: linux\n\n{RUNTIME_END}"
+    content = "Host instructions\n\n" + block + "\n\nEphemeral note"
+
+    selected = engine.select_context([{"role": "system", "content": content},
+                                      {"role": "user", "content": "task"}])
+
+    assert selected[0]["content"] == "Host instructions\n\nEphemeral note\n\n" + SYSTEM_PROMPT
+    assert selected[2] == {"role": "user", "content": block}
+
+
+def test_selection_leaves_an_unmarked_block_alone(tmp_path):
+    engine = OptChatEngine(tmp_path, summarize=FakeSummarizer())
+    block = f"{RUNTIME_HEADING}\n\nHost: linux\n\n{RUNTIME_END}"
+    content = "Host instructions\n\n" + block
+
+    selected = engine.select_context([{"role": "system", "content": content},
+                                      {"role": "user", "content": "task"}])
+
+    # No host markers: change nothing; the system text keeps the block where it was.
+    assert selected[0]["content"] == content + "\n\n" + SYSTEM_PROMPT
+    assert [message["role"] for message in selected] == ["system", "assistant", "user"]
+
+
+def test_selection_requires_the_host_end_marker(tmp_path, monkeypatch):
+    _host_runtime_markers(monkeypatch)
+    engine = OptChatEngine(tmp_path, summarize=FakeSummarizer())
+    content = "Host instructions\n\n" + RUNTIME_HEADING + "\n\nno end marker here"
+
+    selected = engine.select_context([{"role": "system", "content": content},
+                                      {"role": "user", "content": "task"}])
+
+    assert selected[0]["content"] == content + "\n\n" + SYSTEM_PROMPT
+    assert len(selected) == 3  # nothing was lifted without the terminator
