@@ -30,6 +30,7 @@ except ModuleNotFoundError as exc:
         """Standalone test base when the Hermes package is unavailable."""
 
 from .compactor import CompactionRequest, Compactor, Summarizer
+from .media import MEDIA_TYPES, archive_media, has_media_parts
 from .prompts import SYSTEM_PROMPT
 from .store import Log
 from .text import split_text
@@ -75,7 +76,10 @@ def _content_text(content: Any) -> str:
         return content
     if isinstance(content, list):
         return "\n".join(part.get("text", "") for part in content
-                         if isinstance(part, dict) and isinstance(part.get("text"), str))
+                         if isinstance(part, dict)
+                         and (not isinstance(part.get("type"), str)
+                              or part["type"] not in MEDIA_TYPES)
+                         and isinstance(part.get("text"), str))
     return "" if content is None else str(content)
 
 
@@ -275,7 +279,8 @@ class OptChatEngine(ContextEngine):
             return records
         if role == "assistant":
             content = _content_text(message.get("content"))
-            return [("unii", chunk) for chunk in split_text(content, node_bytes)] if content else []
+            return ([("unii", chunk) for chunk in split_text(content, node_bytes)]
+                    if content or has_media_parts(message.get("content")) else [])
         return []
 
     @staticmethod
@@ -386,8 +391,10 @@ class OptChatEngine(ContextEngine):
             else:
                 records = [(kind, text, None, None) for kind, text in
                            self._records(message, self.node_bytes, tool_name)]
-            for kind, text, name, key in records:
+            for record_index, (kind, text, name, key) in enumerate(records):
                 index = log.append(kind, text)
+                if record_index == 0:
+                    archive_media(self._chat_root, index, message.get("content"))
                 compactor.seed(index, text)
                 view.add_root(index)
                 if name is not None and key is not None:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from .media import media_for
 from .store import Log
 from .tree import Tree
 from .view import View
@@ -42,7 +43,8 @@ def zoom(log: Log, tree: Tree, view: View, id: int | str, n: int = 1,
         if record is None:
             return _error("message does not exist")
         return json.dumps({"id": id, "n": 1, "kind": record.kind,
-                           "text": record.text}, ensure_ascii=False)
+                           "text": record.text, "media": media_for(log.root, id)},
+                          ensure_ascii=False)
 
     # A named node covers [id, id+n). Both children must have been built.
     if id + n > log.count():
