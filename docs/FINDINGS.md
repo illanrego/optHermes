@@ -20,7 +20,7 @@ below is **not yet implemented** as of this file.
 | WP4 | #5, #8 | maintained views, scheduling, admission (cache) | astra @ high | DONE (07865b0) |
 | WP5 | #1, #7 | provider-aware cache planning (cache) | astra @ high | DONE (e103aa2) |
 | WP5b | (WP5 follow-up) | group the view's cache blocks 4 lines at a time | sol @ high | DONE (af62f01) |
-| WP6 | #10, #11, #12, tree tail | ingestion identity and recovery | astra @ high | BLOCKED (codex limit; retry after 06:11) |
+| WP6 | #10, #11, #12, tree tail | ingestion identity and recovery | by hand (codex limit) | DONE (acebbcd) |
 | WP7 | #14, #15 | child identity and navigation | sol @ high | TODO |
 | WP8 | #6, #17, #20 | prompt volatility, media envelope, host fallback | sol @ high | TODO |
 
@@ -89,11 +89,12 @@ then the marks that make it cacheable); **WP6** is a release blocker for durable
 
 ## WP6 - ingestion identity and recovery
 
-**Blocked mid-run by a Codex usage limit.** A partial, unreviewed helper is in the working tree at
-`optchat/persistence.py` (58 lines, parses cleanly, imported by nothing): `sync_directory`,
-`atomic_json`, and a `read_jsonl` that seals an interrupted final line with NUL + newline so only
-explicitly sealed fragments may be ignored later while ordinary mid-file corruption still raises.
-Treat it as a starting point or discard it. The suite is green at 161 tests.
+**Completed by hand after the Codex usage limit stopped the delegated run mid-write.** Its partial
+helper, `optchat/persistence.py`, was reviewed and integrated (the tail rule and the durable-rename
+pair). Done in four passes - the torn tail and duplicate ids, the tree's counterpart, recovery of
+missing roots and the unapplied suffix, and the durable ingestion checkpoint - each committed
+separately, the suite green after every pass, and every new test verified to fail against the old
+code first.
 
 - **#10** ingestion runs only at end-of-turn (the host calls it best-effort), and dedup is a single
   counter: a restart duplicates or skips, and an equal-length transcript can be skipped entirely.
