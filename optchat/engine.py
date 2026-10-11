@@ -31,8 +31,12 @@ child rendering the master's view; a child's own chat is reached only with an
 explicit scope. ``scope="Name"`` resolves against that child's chat, and an
 unknown or unmapped scope is an error, never a silent fallback. A delegate
 result's name-to-child mapping is registered as soon as the result is visible to
-a selection of the running turn, not only at ``on_turn_complete``; a name already
-mapped to a different child keeps its first mapping and warns once.
+a selection of the running turn, not only at ``on_turn_complete``. A name already
+mapped to a different child keeps its first mapping; the conflicting child
+instead receives the first free suffixed label (``"Name 2"``, incrementing until
+free), stored in the index and used in its work record, so the name the model
+reads in a record is the name it can zoom by. A label already mapped to the same
+child is reused, so labels stay stable across turns and restarts.
 
 The host's runtime block (date, session id, model, platform) is moved out of the
 system text and re-delivered verbatim on the user channel after the view, so the
@@ -703,37 +707,56 @@ class OptChatEngine(ContextEngine):
             os.fsync(stream.fileno())
         os.replace(temporary, path)
 
-    def _register_child(self, name: str, key: str) -> None:
-        """Record ``name -> key``; an existing mapping to another child is kept.
+    def _register_child(self, name: str, key: str) -> str:
+        """Record ``name -> key`` and return the durable label for ``key``.
 
-        The first mapping wins: a repeated name that resolves to a different child
-        warns once (per name) instead of silently repointing the model at another
-        chat. Re-registering the same pair is idempotent.
+        The first mapping wins: a name already mapped to a different child is never
+        repointed, so older labels keep working. The conflicting child instead
+        receives the first free suffixed label (``"Name 2"``, ``"Name 3"``, ...),
+        probed in the persisted index so the label stays stable across turns and
+        restarts; a label already mapped to this child is reused, never replaced.
+        Re-registering the same pair is idempotent.
         """
         index = self._child_index()
         existing = index.get(name)
         if existing == key:
-            return
-        if existing is not None:
-            if name not in self._warned_child_conflicts:
-                self._warned_child_conflicts.add(name)
-                warnings.warn(
-                    f"OptChat: subagent name {name!r} already maps to child {existing!r}; "
-                    f"keeping it and ignoring child {key!r}.",
-                    RuntimeWarning, stacklevel=2)
-            return
-        index[name] = key
-        self._save_child_index(index)
+            return name
+        if existing is None:
+            index[name] = key
+            self._save_child_index(index)
+            return name
+        # The name is taken by another child. Never repoint it; give this child the
+        # first label it already owns, else the first free one.
+        suffix = 2
+        while True:
+            label = f"{name} {suffix}"
+            mapped = index.get(label)
+            if mapped == key:
+                break
+            if mapped is None:
+                index[label] = key
+                self._save_child_index(index)
+                break
+            suffix += 1
+        if name not in self._warned_child_conflicts:
+            self._warned_child_conflicts.add(name)
+            warnings.warn(
+                f"OptChat: subagent name {name!r} already maps to child {existing!r}; "
+                f"the conflicting report is labeled {label!r} so its own chat stays "
+                f"addressable.",
+                RuntimeWarning, stacklevel=2)
+        return label
 
     def _register_arrived_delegates(self, messages: list[dict[str, Any]], start: int) -> None:
-        """Register ``name -> child`` for delegate results already visible this turn.
+        """Register ``label -> child`` for delegate results already visible this turn.
 
         The host shows the running turn's rows to ``select_context`` as they arrive,
         so a report can be zoomed by name in the turn it returns, not only after
         ``on_turn_complete`` ingests it. Each result row is resolved once (by row
-        fingerprint) and its resolution is kept for ingestion, so the logged
-        ``[Name]`` always matches the registered mapping. Rows before the turn
-        boundary are left to ingestion.
+        fingerprint) - ``_delegate_work`` claims each child's durable label in the
+        index as it resolves it - and the resolution is kept for ingestion, so the
+        logged ``[Label]`` always matches the registered mapping. Rows before the
+        turn boundary are left to ingestion.
         """
         if not self._writes or self._chat_root != self.root:
             return
@@ -762,14 +785,17 @@ class OptChatEngine(ContextEngine):
                 if not resolved:
                     continue
                 self._arrived_records[fingerprint] = resolved
-                for name, _record, key in resolved:
-                    if key is not None:
-                        self._register_child(name, key)
         except (OSError, ValueError) as exc:
             logger.warning("OptChat could not register an arrived subagent report: %s", exc)
 
     def _delegate_work(self, text: str, known_keys: set[str]) -> list[tuple[str, str, str | None]]:
-        """Return (label, record text, child key) for a completed delegate result."""
+        """Return (label, record text, child key) for a completed delegate result.
+
+        Each child is registered under its label here, before the record text is
+        built: a name already mapped to a different child leaves that mapping
+        untouched and this child claims the first free suffixed label, so the name
+        the model reads in the record is the name it can zoom by.
+        """
         try:
             payload = json.loads(text)
         except json.JSONDecodeError:
@@ -800,7 +826,8 @@ class OptChatEngine(ContextEngine):
                          if isinstance(candidate.get(field), str) and candidate[field].strip()),
                         key or _delegate_name(text))
             body = json.dumps(entry, ensure_ascii=False) if entry is not None and len(entries) > 1 else text
-            work.append((name, f"[{name}] {body}", key))
+            label = self._register_child(name, key) if key is not None else name
+            work.append((label, f"[{label}] {body}", key))
         return work
 
     def _ingest_rows(self, messages: list[dict[str, Any]], start: int, end: int) -> None:
@@ -838,8 +865,9 @@ class OptChatEngine(ContextEngine):
                 fingerprint = _row_fingerprint(message)
                 arrived = self._arrived_records.pop(fingerprint, None)
                 if arrived is not None:
-                    # A selection of this running turn already resolved the row;
-                    # reuse it so the logged [Name] matches the registered mapping.
+                    # A selection of this running turn already resolved the row and
+                    # claimed its labels; reuse it so the logged [Label] matches the
+                    # registered mapping.
                     records = [("work", record, name, key) for name, record, key in arrived]
                     for _name, _record, key in arrived:
                         if key is not None:
@@ -847,20 +875,18 @@ class OptChatEngine(ContextEngine):
                 else:
                     records = [("work", record, name, key) for name, record, key in
                                self._delegate_work(_content_text(message.get("content")), known_keys)]
-                # Ingestion resolved this row: a later selection must not resolve
-                # it again (the name is registered below, from this resolution).
+                # Ingestion resolved this row: a later selection must not resolve it
+                # again (each child's label was claimed during the resolution above).
                 self._arrived_rows.add(fingerprint)
             else:
                 records = [(kind, text, None, None) for kind, text in
                            self._records(message, self.node_bytes, tool_name)]
-            for record_index, (kind, text, name, key) in enumerate(records):
+            for record_index, (kind, text, _label, _key) in enumerate(records):
                 index = log.append(kind, text)
                 if record_index == 0:
                     archive_media(chat_root, index, message.get("content"))
                 compactor.seed(index, text, kind)
                 view.add_root(index)
-                if name is not None and key is not None:
-                    self._register_child(name, key)
             # Advance only once every record of this row is durable, so a crash
             # mid-row re-ingests that row instead of skipping its other records.
             recent.append(_row_fingerprint(message))

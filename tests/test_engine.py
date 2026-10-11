@@ -4,6 +4,7 @@ import copy
 import importlib.util
 import json
 import logging
+import re
 import sys
 import types
 import warnings
@@ -420,6 +421,101 @@ def test_withheld_transcript_can_be_recovered_from_view_and_zoom(tmp_path):
     assert "ORCHID-17" in recovered["text"]
 
 
+def _zoom_from_view(engine, view_text, target):
+    """The engine's side of what a model does with the view.
+
+    Read the view's lines, pick the one covering ``target``, call ``optchat_zoom``
+    for it, and follow the returned halves until the raw message is reached. Returns
+    ``(payload, calls, picked line)``; the picked line is the summary the model saw.
+    """
+    picked = None
+    for line in view_text.splitlines():
+        match = re.match(r"^(\d+)\+(\d+)\|", line)
+        if match and int(match.group(1)) <= target < int(match.group(1)) + int(match.group(2)):
+            picked = (int(match.group(1)), int(match.group(2)), line)
+            break
+    assert picked is not None, "the view has no line covering the folded message"
+    id_, n, line = picked
+    for calls in range(1, 64):
+        answer = json.loads(engine.handle_tool_call("optchat_zoom", {"id": id_, "n": n}))
+        if n == 1:
+            return answer, calls, line
+        half = next(h for h in answer["halves"] if h["id"] <= target < h["id"] + h["n"])
+        id_, n = half["id"], half["n"]
+    raise AssertionError("navigation never reached the raw message")
+
+
+def test_transcript_swap_acceptance_view_and_zoom_recover_folded_detail(tmp_path):
+    """The engine's side of a real loop, end to end through its own surfaces.
+
+    The transcript is withheld and the view stands in; a scripted model reads the
+    view, picks the summary line covering the folded message, navigates with
+    ``optchat_zoom`` until the raw text comes back, and the next request carries
+    that tool result with still no transcript. A real model choosing zoom is the
+    live run, not this test.
+    """
+    class CueSummarizer(FakeSummarizer):
+        def __call__(self, prompt):
+            self.prompts.append(prompt)
+            return "compacted span; its exact words are behind optchat_zoom"
+
+    engine = OptChatEngine(tmp_path, node_bytes=96, view_min_bytes=0,
+                           view_max_bytes=120, summarize=CueSummarizer())
+    secret = "the access code is FERN-42; " + "filler " * 40
+    system_row = {"role": "system", "content": "host"}
+    old = [
+        {"role": "user", "content": "kickoff"},
+        {"role": "assistant", "content": None, "tool_calls": [
+            {"id": "c1", "function": {"name": "lookup", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "c1", "content": secret},
+        {"role": "assistant", "content": "noted"},
+    ]
+    engine.on_turn_complete([system_row] + old)
+    assert secret not in engine.view.render()  # the detail is folded away
+
+    question = {"role": "user", "content": "What was the access code?"}
+    request = [system_row] + old + [question]
+    selected = engine.select_context(request, incoming_message=question)
+
+    # The transcript is gone; the view stands in, and the current turn remains.
+    assert len(selected) == 3
+    assert selected[1]["role"] == "assistant"
+    assert selected[1]["content"] == engine.view.render()
+    assert selected[2:] == [question]
+    for row in old:
+        assert row not in selected
+    assert all(secret not in str(message.get("content")) for message in selected)
+
+    # The scripted model reads the view, picks the line covering the folded message,
+    # and navigates with the tool until the raw message comes back.
+    answer, calls, picked_line = _zoom_from_view(engine, selected[1]["content"], target=2)
+    assert secret not in picked_line  # the line the model picked is a summary
+    assert calls >= 1
+    assert (answer["id"], answer["n"], answer["kind"]) == (2, 1, "echo")
+    assert secret in answer["text"]  # the folded-away detail came back
+
+    # The next request the model would see: the tool call and its result ride the
+    # current turn, and the transcript is still withheld.
+    zoom_call = {"role": "assistant", "content": None, "tool_calls": [
+        {"id": "zoom-1", "function": {"name": "optchat_zoom",
+                                      "arguments": json.dumps({"id": 2, "n": 1})}}]}
+    zoom_result = {"role": "tool", "tool_call_id": "zoom-1",
+                   "content": json.dumps(answer, ensure_ascii=False)}
+    next_request = request + [zoom_call, zoom_result]
+    engine.on_message(next_request, copy.deepcopy(zoom_call))
+    engine.on_message(next_request, copy.deepcopy(zoom_result))
+    next_selected = engine.select_context(next_request, incoming_message=question)
+
+    assert next_selected[1]["content"].startswith("<chat>")
+    assert next_selected[-1] == zoom_result
+    assert secret in next_selected[-1]["content"]
+    for row in old:
+        assert row not in next_selected
+    # The detail appears exactly once - in the tool result - never via the view.
+    assert sum(secret in str(message.get("content")) for message in next_selected) == 1
+    engine.log.close()
+
+
 def test_subagent_has_own_chat_and_master_records_one_work(tmp_path):
     master = OptChatEngine(tmp_path, summarize=FakeSummarizer())
     master.on_session_start("master", platform="cli")
@@ -635,6 +731,94 @@ def test_repeated_name_keeps_the_first_child_and_warns_once(tmp_path):
     scoped = json.loads(master.handle_tool_call(
         "optchat_zoom", {"id": 0, "n": 1, "scope": "Researcher"}))
     assert scoped["text"] == "work in child-a"
+
+
+def test_duplicate_name_leaves_the_new_report_addressable(tmp_path):
+    """P6b: a delegate result whose name is already mapped to another child must
+    stay reachable. The first mapping is kept, the conflicting child receives the
+    first free suffixed label, and that label is what its work record carries and
+    what the model can zoom by - durable in the index, so it survives later turns
+    and a restart."""
+    master = OptChatEngine(tmp_path, summarize=FakeSummarizer())
+    master.on_session_start("master", platform="cli")
+    for key in ("child-a", "child-b"):
+        child = master.clone_for_agent()
+        child.on_session_start(key, platform="subagent")
+        child.on_turn_complete([{"role": "user", "content": f"work in {key}"}])
+
+    def result(call_id, child_key):
+        return {"role": "tool", "tool_call_id": call_id,
+                "content": json.dumps({"results": [{"name": "Researcher",
+                                                    "child_session_id": child_key,
+                                                    "summary": child_key}]})}
+
+    call = {"role": "assistant", "content": None, "tool_calls": [
+        {"id": "delegate-a", "function": {"name": "delegate_task"}},
+        {"id": "delegate-b", "function": {"name": "delegate_task"}}]}
+    messages = [{"role": "user", "content": "task"}, call,
+                result("delegate-a", "child-a"), result("delegate-b", "child-b")]
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        master.on_turn_complete(messages)
+
+    conflicts = [item for item in caught if "already maps" in str(item.message)]
+    assert len(conflicts) == 1
+    assert "'Researcher 2'" in str(conflicts[0].message)
+
+    index = json.loads((tmp_path / "agents" / "index.json").read_text(encoding="utf-8"))
+    assert index == {"Researcher": "child-a", "Researcher 2": "child-b"}
+
+    # Each work record carries the label its child is registered under; the first
+    # child keeps the original name, the second is reachable as "Researcher 2".
+    records = [record.text for record in master.log.range(0, master.log.count() - 1)]
+    assert records[-2].startswith("[Researcher] ")
+    assert records[-1].startswith("[Researcher 2] ")
+
+    # The original name stays an alias to the first child; the suffixed label opens
+    # the new one, by name and by scope.
+    assert "work in child-a" in json.loads(
+        master.handle_tool_call("optchat_zoom", {"id": "Researcher"}))["chat"]
+    opened = json.loads(master.handle_tool_call("optchat_zoom", {"id": "Researcher 2"}))
+    assert opened["scope"] == "Researcher 2"
+    assert "work in child-b" in opened["chat"]
+    scoped = json.loads(master.handle_tool_call(
+        "optchat_zoom", {"id": 0, "n": 1, "scope": "Researcher 2"}))
+    assert scoped["text"] == "work in child-b"
+
+    # A later report for the same child reuses its label: no new mapping, no new
+    # warning, and the record still carries the label that opens it.
+    later = [{"role": "assistant", "content": None, "tool_calls": [
+        {"id": "delegate-c", "function": {"name": "delegate_task"}}]},
+        result("delegate-c", "child-b")]
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        master.on_turn_complete(messages + later)
+    assert not [item for item in caught if "already maps" in str(item.message)]
+    assert master.log.get(master.log.count() - 1).text.startswith("[Researcher 2] ")
+    assert json.loads((tmp_path / "agents" / "index.json").read_text(
+        encoding="utf-8")) == index
+    master.log.close()
+
+    # A restart resolves the same conflict to the same label, because the label
+    # lives in the index rather than in memory.
+    restarted = OptChatEngine(tmp_path, summarize=FakeSummarizer())
+    restarted.on_session_start("master", platform="cli")
+    restarted.on_turn_complete(messages + later)  # the same transcript, resent
+    extra = [{"role": "assistant", "content": None, "tool_calls": [
+        {"id": "delegate-d", "function": {"name": "delegate_task"}}]},
+        result("delegate-d", "child-b")]
+    with warnings.catch_warnings(record=True):
+        warnings.simplefilter("always")
+        restarted.on_turn_complete(messages + later + extra)
+    assert restarted.log.get(restarted.log.count() - 1).text.startswith("[Researcher 2] ")
+    assert json.loads((tmp_path / "agents" / "index.json").read_text(
+        encoding="utf-8")) == index
+    assert "work in child-b" in json.loads(
+        restarted.handle_tool_call("optchat_zoom", {"id": "Researcher 2"}))["chat"]
+    assert "work in child-a" in json.loads(
+        restarted.handle_tool_call("optchat_zoom", {"id": "Researcher"}))["chat"]
+    restarted.log.close()
 
 
 def test_cron_context_never_writes(tmp_path):
