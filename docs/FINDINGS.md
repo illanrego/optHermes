@@ -23,7 +23,7 @@ below is **not yet implemented** as of this file.
 | WP6 | #10, #11, #12, tree tail | ingestion identity and recovery | by hand (codex limit) | DONE (acebbcd) |
 | WP7 | #14, #15 | child identity and navigation | sol @ high | DONE (030fc2e) |
 | WP8 | #6, #17, #20 | prompt volatility, media envelope, host fallback | sol @ high | DONE (b7c185a) |
-| WP9 | (seam wiring) | use the three host seams: tools for compactions, refusal for admission, per-message for live logging | TODO | TODO |
+| WP9 | (seam wiring) | use the three host seams: tools for compactions, refusal for admission, per-message for live logging | by hand | DONE (working tree) |
 
 Order and why: **WP1** first (the turn-boundary bug is the most urgent active-turn defect and
 the other two are tiny); **WP2** before sustained compaction (a node is immutable, so unlabelled
@@ -129,6 +129,31 @@ code first.
   compaction also touches `summary_target_ratio`, which we do not define. Host-side, but the
   engine should fail loudly rather than silently lose its guarantee.
 
+## WP9 - the three host seams wired
+
+The seams built in the seam worktree (`cf1743d63a`) are in use - the refusal is the exception: it
+is deliberately NOT used. (Uncommitted at the time of writing.)
+
+- **tools to `select_context`** (#2's host half): captured exactly as `cache_plan` captures them
+  (one shared rule: deep copy, latch, update the compactor), so a compaction sends the turn's tools
+  on **any** route, including one where no cache-plan hook fires. `None` keeps today's navigation
+  fallback and its one-time warning; nothing is invented, and an explicitly empty list is a
+  capture.
+- **`on_message`** (#10's host half): each appended message is ingested as the turn unfolds, with
+  the same classification `on_turn_complete` uses (one shared walk). Ingestion starts at the
+  checkpoint boundary, so the turn's user row and unnotified synthetic rows come with it, and the
+  appended row is located in the list it is handed, never assumed to be the last row.
+  `on_turn_complete` stays the reconciler; the checkpoint makes it a no-op for rows already
+  ingested. A restart resumes at the boundary, and a crash mid-turn cannot skip a row.
+- **`ContextSelectionBlocked`** (#8's host half) - deliberately not raised. `select_context`
+  already settles for free before rendering (`compactor.settle(...)`, `model_calls=False` by
+  default), which is the most admission possible without starting a model call on the turn path.
+  Refusing would make the host re-assemble once and then send its own original request - the full
+  transcript plus Hermes' own compression - which is strictly worse than serving a view that still
+  carries placeholders: a stable view prefix is what compactions read, and a transcript swap
+  destroys that. A turn served with an unsettled view logs one debug line instead, so the
+  condition is visible when it happens and silent when it does not.
+
 ## Upstream (built locally, not PR'd)
 
 Three additive seams are implemented on branch `feat/context-engine-seams` in the seam worktree
@@ -140,6 +165,9 @@ Three additive seams are implemented on branch `feat/context-engine-seams` in th
   yet; the host re-assembles once, then sends the original messages with a warning.
 - **`on_message`** (#10's host half) - a per-append observation hook, so an engine can log as things
   happen instead of waiting for the turn boundary.
+
+The engine now uses the tools and per-message seams; the refusal seam is deliberately unused - see
+the WP9 section for why.
 
 Nothing is PR'd: on the user's instruction, nothing goes upstream until it has been tested on his
 terms.
