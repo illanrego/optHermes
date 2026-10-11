@@ -35,3 +35,28 @@ def test_zoom_rejects_bad_coordinates_and_date_is_stored(tmp_path):
         assert "error" in json.loads(zoom(log, tree, view, 1, 2))
         assert json.loads(date(log, index))["date"] == log.get(index).date
         assert "error" in json.loads(date(log, 99))
+
+
+def test_zoom_child_chat_and_invalid_names(tmp_path):
+    child_root = tmp_path / "agents" / "child-session"
+    with Log(child_root) as child_log:
+        child_tree = Tree(child_root)
+        child_view = View(child_tree)
+        index = child_log.append("user", "child task")
+        Compactor(child_tree, lambda prompt: "summary").seed(index, "child task")
+        child_view.add_root(index)
+        child_tree.save()
+        child_view.save()
+    (tmp_path / "agents" / "index.json").write_text(
+        json.dumps({"Researcher": "child-session"}), encoding="utf-8")
+
+    with Log(tmp_path) as master_log:
+        master_tree = Tree(tmp_path)
+        master_view = View(master_tree)
+        master_log.append("user", "master task")
+        assert json.loads(zoom(master_log, master_tree, master_view, 0, 1))["text"] == "master task"
+        result = json.loads(zoom(master_log, master_tree, master_view, "Researcher"))
+        assert result["name"] == "Researcher"
+        assert result["chat"] == "<chat>\n0+1|child task\n</chat>"
+        assert "error" in json.loads(zoom(master_log, master_tree, master_view, "Unknown"))
+        assert "error" in json.loads(zoom(master_log, master_tree, master_view, 1.5))

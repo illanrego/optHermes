@@ -6,6 +6,7 @@ import logging
 
 from optchat import OptChatEngine
 from optchat.prompts import SYSTEM_PROMPT
+from optchat.store import Log
 from optchat.tree import Tree
 
 
@@ -74,6 +75,10 @@ def test_ingestion_is_idempotent_and_clone_shares_store(tmp_path):
     assert engine.should_compress() is False
     assert {schema["function"]["name"] for schema in engine.get_tool_schemas()} == {
         "optchat_zoom", "optchat_date"}
+    zoom_schema = engine.get_tool_schemas()[0]["function"]["parameters"]
+    assert zoom_schema["properties"]["id"]["anyOf"] == [
+        {"type": "integer"}, {"type": "string"}]
+    assert zoom_schema["required"] == ["id"]
 
 
 def test_tool_mapping_and_json_errors(tmp_path):
@@ -218,17 +223,58 @@ def test_withheld_transcript_can_be_recovered_from_view_and_zoom(tmp_path):
     assert "ORCHID-17" in recovered["text"]
 
 
-def test_subagent_context_reads_but_never_writes(tmp_path):
-    """A subagent must not append to the chat: only its final report returns as a
-    ``work`` message to the master. The host reports platform="subagent"."""
-    engine = OptChatEngine(tmp_path, summarize=FakeSummarizer())
-    engine.on_session_start("session", platform="subagent")
-    engine.on_turn_complete([{"role": "user", "content": "subagent step"},
-                             {"role": "assistant", "content": "subagent reply"}])
-    assert engine.log.count() == 0
-    # It still reads: a subagent's first message is the view.
-    assert engine.select_context([{"role": "system", "content": "host"},
-                                  {"role": "user", "content": "task"}]) is not None
+def test_subagent_has_own_chat_and_master_records_one_work(tmp_path):
+    master = OptChatEngine(tmp_path, summarize=FakeSummarizer())
+    master.on_session_start("master", platform="cli")
+    master.on_turn_complete([{"role": "user", "content": "master context"}])
+    master_view = master.view.render()
+
+    child = master.clone_for_agent()
+    child.on_session_start("child-session", platform="subagent")
+    selected = child.select_context([{"role": "system", "content": "host"},
+                                     {"role": "user", "content": "task"}])
+    assert selected[1]["content"] == master_view
+    child.on_turn_complete([{"role": "user", "content": "subagent step"},
+                            {"role": "assistant", "content": "subagent reply"}])
+    assert child.log.root == tmp_path / "agents" / "child-session"
+    assert [record.text for record in child.log.range(0, 1)] == [
+        "subagent step", "subagent reply"]
+    assert master.log.count() == 1
+    child.log.close()
+    with Log(tmp_path / "agents" / "child-session") as reopened:
+        assert reopened.count() == 2
+
+    master.on_turn_complete([{"role": "user", "content": "master context"},
+                             {"role": "assistant", "tool_calls": [
+                                 {"id": "delegate-1", "function": {"name": "delegate_task"}}]},
+                             {"role": "tool", "tool_call_id": "delegate-1", "content": json.dumps({
+                                 "results": [{"task_index": 0, "status": "completed",
+                                              "summary": "finished"}]})}])
+    records = master.log.range(0, master.log.count() - 1)
+    assert [record.kind for record in records].count("work") == 1
+    assert all("subagent step" not in record.text for record in records)
+    assert records[-1].text.startswith("[child-session] ")
+    assert json.loads((tmp_path / "agents" / "index.json").read_text())["child-session"] == "child-session"
+
+
+def test_delegate_name_maps_to_explicit_child_session_id(tmp_path):
+    master = OptChatEngine(tmp_path, summarize=FakeSummarizer())
+    master.on_session_start("master", platform="cli")
+    child = master.clone_for_agent()
+    child.on_session_start("child-session", platform="subagent")
+    child.on_turn_complete([{"role": "user", "content": "find the answer"}])
+    result = {"results": [{"task_index": 0, "name": "Researcher",
+                            "child_session_id": "child-session", "summary": "found it"}]}
+    master.on_turn_complete([
+        {"role": "assistant", "tool_calls": [
+            {"id": "delegate-1", "function": {"name": "delegate_task"}}]},
+        {"role": "tool", "tool_call_id": "delegate-1", "content": json.dumps(result)},
+    ])
+    assert master.log.get(1).text.startswith("[Researcher] ")
+    assert json.loads((tmp_path / "agents" / "index.json").read_text()) == {
+        "Researcher": "child-session"}
+    assert "find the answer" in json.loads(master.handle_tool_call(
+        "optchat_zoom", {"id": "Researcher"}))["chat"]
 
 
 def test_cron_context_never_writes(tmp_path):
