@@ -1,9 +1,15 @@
 """Host-independent tests for the OptChat adapter."""
 
 import copy
+import importlib.util
 import json
 import logging
+import sys
+import types
+import warnings
 from pathlib import Path
+
+import pytest
 
 from optchat import OptChatEngine
 from optchat.prompts import SYSTEM_PROMPT
@@ -18,6 +24,97 @@ class FakeSummarizer:
     def __call__(self, prompt):
         self.prompts.append(prompt)
         return "summary"
+
+
+@pytest.fixture
+def cache_engine_class(monkeypatch):
+    """Load the adapter against the host seam without changing other tests' ABC."""
+    agent = types.ModuleType("agent")
+    agent.__path__ = []
+    base = types.ModuleType("agent.context_engine")
+    base.ContextEngine = type("ContextEngine", (), {"cache_plan": lambda self: None})
+    monkeypatch.setitem(sys.modules, "agent", agent)
+    monkeypatch.setitem(sys.modules, "agent.context_engine", base)
+    spec = importlib.util.spec_from_file_location(
+        "optchat._engine_with_cache_seam", Path(__file__).parents[1] / "optchat" / "engine.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.OptChatEngine
+
+
+@pytest.mark.parametrize("capture_before_start", [False, True])
+@pytest.mark.parametrize("tools", [[], [
+    {"type": "function", "function": {"name": "host_search",
+     "parameters": {"type": "object", "properties": {"query": {"type": "string"}}}}},
+]])
+def test_cache_plan_tools_reach_next_compaction(
+        tmp_path, cache_engine_class, capture_before_start, tools):
+    summarizer = FakeSummarizer()
+    engine = cache_engine_class(tmp_path, summarize=summarizer, node_bytes=16)
+    tools = copy.deepcopy(tools)
+    expected = copy.deepcopy(tools)
+    if not capture_before_start:
+        engine.on_session_start("session")
+    engine.cache_plan([], tools)
+    if not capture_before_start:
+        assert engine.compactor.tools == expected  # Updated before any selection.
+    tools.append({"function": {"name": "later_host_mutation"}})
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        engine.select_context([{"role": "user", "content": "task"}])
+        engine.on_turn_complete([{"role": "tool", "content": "long result " * 5}])
+    assert not caught
+    assert summarizer.prompts
+    assert all(request.tools == expected for request in summarizer.prompts)
+    engine.log.close()
+
+
+def test_missing_tools_warn_once_per_engine_and_keep_fallback(tmp_path):
+    for name in ("first", "second"):
+        summarizer = FakeSummarizer()
+        engine = OptChatEngine(tmp_path / name, summarize=summarizer, node_bytes=16)
+        messages = [{"role": "tool", "content": "long result " * 5}]
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            engine.on_turn_complete(messages)
+            engine.on_turn_complete(messages + messages)
+        assert len(caught) == 1
+        assert caught[0].category is RuntimeWarning
+        assert "cache-policy gates cache_plan, the only hook that carries tools" in str(caught[0].message)
+        assert summarizer.prompts
+        assert all(request.tools == engine.get_tool_schemas() for request in summarizer.prompts)
+        engine.log.close()
+
+
+@pytest.mark.parametrize("route, should_warn", [
+    ({}, False),
+    ({"provider": None, "model": ""}, False),
+    ({"provider": "auto", "model": "auto"}, False),
+    ({"provider": "auto"}, False),
+    ({"provider": "other"}, True),
+    ({"model": "other-model"}, True),
+    ({"provider": "auto", "model": "other-model"}, True),
+    ({"provider": "other", "model": "other-model"}, True),
+])
+def test_route_override_warns_once_per_engine(tmp_path, monkeypatch, route, should_warn):
+    config = types.ModuleType("hermes_cli.config")
+    config.load_config_readonly = lambda: {"auxiliary": {"optchat": dict(route)}}
+    monkeypatch.setitem(sys.modules, "hermes_cli.config", config)
+    before = copy.deepcopy(route)
+    for name in ("first", "second"):
+        engine = OptChatEngine(tmp_path / name, summarize=FakeSummarizer())
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            engine.on_session_start("session", model="turn-model")
+            engine.on_session_start("session", model="turn-model")
+        assert engine._turn_model == "turn-model"
+        assert len(caught) == int(should_warn)
+        if should_warn:
+            assert caught[0].category is RuntimeWarning
+            assert "may not share the turns' cache entry" in str(caught[0].message)
+            assert "turn-model" in str(caught[0].message)
+        engine.log.close()
+    assert route == before
 
 
 def test_selection_keeps_only_current_turn_and_does_not_mutate_history(tmp_path):

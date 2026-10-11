@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextvars
 import heapq
 import time
 import warnings
@@ -193,7 +194,11 @@ class Compactor:
                                               RuntimeWarning, stacklevel=2)
                                 deferred.append(key)
                                 continue
-                            batch.append((key, executor.submit(self._summarize, request, key)))
+                            # Each job needs its own snapshot: a Context cannot be
+                            # entered concurrently, and workers must inherit the caller.
+                            context = contextvars.copy_context()
+                            batch.append((key, executor.submit(
+                                context.run, self._summarize, request, key)))
                         except Exception as exc:
                             warnings.warn(f"Compaction {key} failed: {exc}",
                                           RuntimeWarning, stacklevel=2)

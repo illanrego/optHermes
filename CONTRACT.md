@@ -349,3 +349,26 @@ content can become a line now; a reasoning-only reply raises, and the node stays
 `hermes_home` the host supplies at session start, keeps an explicit constructor root as the
 override, and falls back to the environment only when neither exists. `register()` therefore
 passes **no root** when there is no manager home, instead of freezing the ambient one.
+
+---
+
+# Revision 5 - compaction request identity and routing (2026-10-11)
+
+- `cache_plan` captures the host's outgoing tools, including an explicitly empty list,
+  and immediately updates the compactor. Startup and selection preserve that capture.
+  Until a capture occurs, compactions keep the two navigation schemas and the engine
+  emits one `RuntimeWarning` before its first end-of-turn compaction pass. On no-mark
+  routes, the host's cache-policy gates the only hook carrying tools; matching the
+  turn's tools requires a host seam passing them to `select_context`.
+- `on_session_start(model=...)` records the turn model. The engine reads the profile's
+  `auxiliary.optchat` route through the host task-config reader at session start and
+  before end-of-turn compaction. Any explicit provider or model other than `auto` or
+  unset produces one override warning per engine: compactions may not share the turn's
+  cache entry. Routing remains host-owned and unchanged. Without the host reader,
+  this check is unavailable.
+- Every model job submitted by `run_pending` runs inside its own caller ContextVar
+  snapshot, captured at submission. This preserves host route pins and accounting
+  context without changing batching, admission, or `run_pending` / `settle` signatures.
+
+These changes do not prove provider cache reuse; auxiliary cache decoration and the
+missing no-mark tool seam remain host work.

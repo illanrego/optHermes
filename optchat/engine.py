@@ -6,6 +6,11 @@ becomes tool (name and JSON arguments, including any accompanying content);
 delegate_task results become work, and other tool results become echo.
 Thinking fields are never logged.
 
+On a no-mark route, the outgoing tools are the one part of the turn's request
+identity that compaction cannot yet match: the host's cache-policy gates the
+only hook carrying tools. Until a host seam passes tools to ``select_context``,
+the navigation schemas remain the fallback, with a warning once per engine.
+
 The retained request tail starts at the host's ``incoming_message`` when that
 message is present in the request (identity first, then equality). Otherwise it
 starts at the last user row. A later steering user row stays in the same turn.
@@ -21,6 +26,7 @@ import copy
 import json
 import logging
 import os
+import warnings
 from pathlib import Path
 from typing import Any
 
@@ -121,6 +127,10 @@ class OptChatEngine(ContextEngine):
         self._chat_root = self.root
         self._turn_system = ""
         self._turn_tools: list[dict[str, Any]] = []
+        self._has_turn_tools = False
+        self._warned_missing_tools = False
+        self._turn_model: str | None = None
+        self._warned_route_override = False
         self._seen_messages = 0
         # Cron reads only; a child writes to its own chat after session start.
         self._writes = False
@@ -136,6 +146,9 @@ class OptChatEngine(ContextEngine):
         return "optchat"
 
     def on_session_start(self, session_id: str, **kwargs: Any) -> None:
+        if "model" in kwargs:
+            self._turn_model = kwargs["model"]
+        self._check_compaction_route()
         if self.root is None:
             home = kwargs.get("hermes_home")
             self.root = Path(home) / "optchat" if home is not None else default_root()
@@ -169,13 +182,47 @@ class OptChatEngine(ContextEngine):
             self.view = View(self.tree, self.view_min_bytes, self.view_max_bytes)
             self.compactor = Compactor(self.tree, self.summarize or _missing_summarizer,
                                        node_bytes=self.node_bytes, view=self.view)
-            self._turn_tools = self.get_tool_schemas()
+            if not self._has_turn_tools:
+                self._turn_tools = self.get_tool_schemas()
             self.compactor.system = self._turn_system
             self.compactor.tools = self._turn_tools
         except BaseException:
             self.log.close()
             self.log = None
             raise
+
+    def _check_compaction_route(self) -> None:
+        """Report an explicit aux route without changing the host's routing."""
+        if self._warned_route_override:
+            return
+        try:
+            from hermes_cli.config import load_config_readonly
+            config = load_config_readonly()
+        except Exception:
+            return  # Standalone use and older hosts have no config reader.
+        auxiliary = config.get("auxiliary") if isinstance(config, dict) else None
+        route = auxiliary.get("optchat") if isinstance(auxiliary, dict) else None
+        if not isinstance(route, dict):
+            return
+        overrides = {key: route[key] for key in ("provider", "model")
+                     if route.get(key) not in (None, "", "auto")}
+        if overrides:
+            self._warned_route_override = True
+            warnings.warn(
+                f"auxiliary.optchat explicitly overrides {overrides!r}; compactions "
+                f"may not share the turns' cache entry (turn model: {self._turn_model!r}). "
+                "Use provider/model auto or unset to inherit the turn's route.",
+                RuntimeWarning, stacklevel=2)
+
+    def _check_compaction_tools(self) -> None:
+        if not self._has_turn_tools and not self._warned_missing_tools:
+            self._warned_missing_tools = True
+            warnings.warn(
+                "OptChat has never captured the turn's outgoing tools: the host's "
+                "cache-policy gates cache_plan, the only hook that carries tools. "
+                "Compactions retain the navigation fallback schemas and cannot match "
+                "the turn's tool prefix. A host seam must pass tools to select_context.",
+                RuntimeWarning, stacklevel=2)
 
     def _open(self) -> tuple[Log, Tree, View, Compactor]:
         if self.log is None:
@@ -214,8 +261,6 @@ class OptChatEngine(ContextEngine):
         _, tree, view, compactor = self._open()
         self._turn_system = _content_text(system[0].get("content"))
         compactor.system = self._turn_system
-        if not hasattr(ContextEngine, "cache_plan"):
-            self._turn_tools = self.get_tool_schemas()
         compactor.tools = self._turn_tools
         built = 0
         try:
@@ -420,6 +465,8 @@ class OptChatEngine(ContextEngine):
         # One save per turn, not per record: the log append is already fsync'd per
         # record, and the tree and view are derived state.
         tree.save()
+        self._check_compaction_tools()
+        self._check_compaction_route()
         compactor.run_pending(limit=8)
         tree.save()
         view.merge_batch(log.count())
@@ -457,6 +504,8 @@ class OptChatEngine(ContextEngine):
         clone._writes = self._writes
         clone._turn_system = self._turn_system
         clone._turn_tools = self._turn_tools
+        clone._has_turn_tools = self._has_turn_tools
+        clone._turn_model = self._turn_model
         for field in ("threshold_tokens", "context_length", "threshold_percent"):
             if hasattr(self, field):
                 setattr(clone, field, getattr(self, field))
@@ -468,6 +517,7 @@ if hasattr(ContextEngine, "cache_plan"):
                     tools: list[dict[str, Any]], **kwargs: Any) -> Any:
         # A mismatched tool list breaks the turn cache prefix compaction reuses.
         self._turn_tools = copy.deepcopy(tools)
+        self._has_turn_tools = True
         if self.compactor is not None:
             self.compactor.tools = self._turn_tools
         try:

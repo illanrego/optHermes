@@ -1,3 +1,4 @@
+import contextvars
 import re
 import threading
 import time
@@ -7,6 +8,33 @@ import pytest
 from optchat.compactor import Compactor
 from optchat.tree import Tree
 from optchat.view import View
+
+
+def test_each_job_inherits_submission_context_without_leaking_changes(tmp_path):
+    route = contextvars.ContextVar("test_compaction_route", default="missing")
+    barrier = threading.Barrier(2, timeout=5)
+    seen = []
+
+    def summarize(_request):
+        inherited = route.get()
+        route.set("worker-local")
+        barrier.wait()
+        seen.append(inherited)
+        return "short"
+
+    compactor = Compactor(Tree(tmp_path, node_bytes=8), summarize, node_bytes=8)
+    for i in range(4):
+        compactor.seed(i, "long source", "user")
+    token = route.set("first-route")
+    try:
+        assert compactor.run_pending(limit=2) == 2
+        assert route.get() == "first-route"
+        route.set("next-route")
+        assert compactor.run_pending(limit=2) == 2
+        assert route.get() == "next-route"
+    finally:
+        route.reset(token)
+    assert seen == ["first-route", "first-route", "next-route", "next-route"]
 
 
 def test_seed_short_is_free_and_long_uses_one_call(tmp_path):
