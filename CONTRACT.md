@@ -372,3 +372,63 @@ passes **no root** when there is no manager home, instead of freezing the ambien
 
 These changes do not prove provider cache reuse; auxiliary cache decoration and the
 missing no-mark tool seam remain host work.
+
+---
+
+# Revision 6 - maintained compaction views and scheduling (2026-10-11)
+
+This supersedes revision 2's recomputed `context_view`, per-pass node limit, and
+the claim that more than eight pending nodes necessarily leave the next turn stale.
+
+## Compaction boundaries and stable requests
+
+`View.context_view(min_bytes=16_000, max_bytes=32_000, *, end=None, target=None)`
+returns a maintained compaction prefix, never a copy of the current live view.
+`target=(l, i)` computes its exclusive boundary as `i` for a root and
+`(i + 1) * 2**l` for a merge. An explicit `end` must agree with that boundary.
+Without a target, `end` defaults to the live view's message count. In all cases,
+the prefix stops at the first unbuilt root; no placeholder enters a compaction.
+
+Each budget pair has an independent working list of pairs and unfinished-batch
+flag. Built roots extend this prefix in order. It merges above its ceiling down
+to its floor, resuming interrupted batches even after falling below the ceiling.
+Historical boundaries split straddling nodes into built descendants, so no line
+includes a source after the requested boundary. They never use the live pairs.
+
+The first request for each target retains the exact built pairs used for its
+context; later calls and retries reuse them even if earlier holes are filled or
+more parents become available. Different targets sharing an end have independent
+snapshots. Calls without a target retain a snapshot per explicit/default end.
+The working view can finish a batch without changing an already issued request.
+Snapshot metadata grows with requested targets; it stores pairs, not duplicate
+summary text. Node immutability preserves the rendered bytes.
+
+`View.save/load` now writes/reads a version-2 object in `view.json`, containing
+the live pairs and unfinished-batch flag, working compaction states, and retained
+request pairs. Legacy list-only files load their original pairs unchanged and
+upgrade on save. Save the tree before the view; saved compaction pairs must refer
+to built nodes. Selection saves its settled view as well as its tree.
+
+## Scheduling and admission
+
+`run_pending(limit=8, *, deadline=None, model_calls=True) -> int` keeps its
+signature and returns the number of nodes built. `limit` now bounds concurrent
+model jobs, capped at eight, rather than the total nodes built. Zero remains a
+no-op. A pass drains ready work, including newly ready parents; free nodes consume
+no model slot. Queues drive scheduling, without scanning the tree for work.
+
+A root can start only when fewer than eight earlier roots are unbuilt, including
+failed or in-flight roots. Merges require both children. Failed model jobs are
+requeued for the next pass, while nodes waiting for readiness or admission are
+reconsidered after progress. Each model job retains its own caller ContextVar
+snapshot. Completion is applied in queue order.
+
+Both live and working compaction batches retain their pending flag until reaching
+their minimum byte size. The scheduler resumes them after each wave of builds.
+If no parent exists that can shrink a view to its minimum, the batch stays pending.
+
+`settle(max_nodes=64, timeout_s=20.0, *, model_calls=False)` keeps its signature
+and its separate total-node and deadline bounds. Its default and the synchronous
+selection path still never start a model call. A running model call cannot be
+interrupted by the deadline. Provider failures, missing sources, or a deadline can
+still leave a live placeholder; host fail-closed admission remains outside WP4.

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import bisect
 import contextvars
 import heapq
 import time
@@ -43,6 +44,10 @@ class Compactor:
         self._pending: list[tuple[int, int]] = []
         self._queued: set[tuple[int, int]] = set()
         self._sources: dict[int, str] = {}
+        self._unbuilt_roots = sorted(
+            line.i for line in view.lines()
+            if line.l == 0 and tree.get(0, line.i) is None
+        ) if view is not None else []
         for key in tree.buildable():
             self.submit(*key)
 
@@ -55,10 +60,20 @@ class Compactor:
         source = f"{kind}: {text}"
         if len(source.encode("utf-8")) <= self.node_bytes:
             self.tree.put(0, i, source)
+            self._forget_source(i)
             self._submit_ready_parent(0, i)
         else:
             self._sources[i] = source
+            position = bisect.bisect_left(self._unbuilt_roots, i)
+            if position == len(self._unbuilt_roots) or self._unbuilt_roots[position] != i:
+                self._unbuilt_roots.insert(position, i)
             self.submit(0, i)
+
+    def _forget_source(self, i: int) -> None:
+        self._sources.pop(i, None)
+        position = bisect.bisect_left(self._unbuilt_roots, i)
+        if position < len(self._unbuilt_roots) and self._unbuilt_roots[position] == i:
+            self._unbuilt_roots.pop(position)
 
     def submit(self, l: int, i: int) -> None:
         if not isinstance(l, int) or not isinstance(i, int) or l < 0 or i < 0:
@@ -96,7 +111,8 @@ class Compactor:
                                ruler="-" * self.node_bytes, input=source)
         return CompactionRequest(
             system=self.system,
-            context=self.view.context_view() if self.view is not None else "",
+            context=self.view.context_view(target=(l, i))
+            if self.view is not None else "",
             task=COMPACTION_SYSTEM.format(rubric=RUBRIC) + "\n\n" + task,
             tools=self.tools,
         )
@@ -135,49 +151,61 @@ class Compactor:
         built = 0
         try:
             deadline = time.monotonic() + timeout_s
-            while built < max_nodes and time.monotonic() < deadline:
-                if self.view is not None and self.view.settled():
-                    break
-                progress = self.run_pending(limit=1, deadline=deadline, model_calls=model_calls)
-                if progress == 0:
-                    break
-                built += progress
+            built = self._run_pending(limit=1, deadline=deadline, model_calls=model_calls,
+                                      max_nodes=max_nodes, stop_when_settled=True)
         except Exception as exc:
             warnings.warn(f"Settle failed: {exc}", RuntimeWarning, stacklevel=2)
         return built
 
     def run_pending(self, limit: int = COMPACT_CONCURRENCY, *, deadline: float | None = None,
                     model_calls: bool = True) -> int:
-        """Build at most ``limit`` nodes, with up to ``limit`` model calls in flight.
+        """Drain ready work with at most min(limit, 8) model calls in flight.
 
         ``model_calls=False`` builds only nodes that need no model (``free_text``) and
         defers the rest. A synchronous caller must use it: the deadline is checked between
         nodes and cannot interrupt a summarizer call already in flight.
         """
+        return self._run_pending(limit=limit, deadline=deadline, model_calls=model_calls)
+
+    def _run_pending(self, *, limit: int, deadline: float | None,
+                     model_calls: bool, max_nodes: int | None = None,
+                     stop_when_settled: bool = False) -> int:
         if not isinstance(limit, int) or limit < 0:
             warnings.warn("Compaction limit must be a nonnegative integer",
                           RuntimeWarning, stacklevel=2)
             return 0
         if limit == 0:
             return 0
+        limit = min(limit, COMPACT_CONCURRENCY)
         built = 0
         deferred: list[tuple[int, int]] = []
+
+        def allowed(reserved: int = 0) -> bool:
+            return ((max_nodes is None or built + reserved < max_nodes)
+                    and (deadline is None or time.monotonic() < deadline)
+                    and not (stop_when_settled and self.view is not None
+                             and self.view.settled() and not self.view._batch_pending))
+
         try:
+            if self.view is not None:
+                self.view.merge_batch(self.view._end())
             with ThreadPoolExecutor(max_workers=limit) as executor:
-                while (self._pending and built < limit
-                       and (deadline is None or time.monotonic() < deadline)):
+                while self._pending and allowed():
+                    before = built
+                    waiting: list[tuple[int, int]] = []
                     batch: list[tuple[tuple[int, int], Future[str | None]]] = []
-                    while (self._pending and built + len(batch) < limit
-                           and (deadline is None or time.monotonic() < deadline)):
+                    while self._pending and len(batch) < limit and allowed(len(batch)):
                         key = heapq.heappop(self._pending)
                         self._queued.discard(key)
                         l, i = key
                         try:
                             if self.tree.get(l, i) is not None:
+                                if l == 0:
+                                    self._forget_source(i)
                                 continue
                             if l > 0 and any(self.tree.get(*child) is None
                                              for child in self.tree.children(l, i)):
-                                deferred.append(key)
+                                waiting.append(key)
                                 continue
                             free = self.tree.free_text(l, i)
                             if free is not None:
@@ -187,6 +215,9 @@ class Compactor:
                                 continue
                             if not model_calls:
                                 deferred.append(key)
+                                continue
+                            if l == 0 and bisect.bisect_left(self._unbuilt_roots, i) >= COMPACT_CONCURRENCY:
+                                waiting.append(key)
                                 continue
                             request = self._request(l, i)
                             if request is None:
@@ -215,13 +246,22 @@ class Compactor:
                             l, i = key
                             self.tree.put(l, i, result)
                             if l == 0:
-                                self._sources.pop(i, None)
+                                self._forget_source(i)
                             built += 1
                             self._submit_ready_parent(l, i)
                         except Exception as exc:
                             warnings.warn(f"Compaction {key} failed: {exc}",
                                           RuntimeWarning, stacklevel=2)
                             deferred.append(key)
+                    if self.view is not None:
+                        self.view.merge_batch(self.view._end())
+                    # Readiness/admission can change after this wave; failed model
+                    # calls stay deferred until the next pass, never spin here.
+                    if built > before:
+                        for key in waiting:
+                            self.submit(*key)
+                    else:
+                        deferred.extend(waiting)
         except Exception as exc:
             warnings.warn(f"Compaction pass failed: {exc}", RuntimeWarning, stacklevel=2)
         finally:

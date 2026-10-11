@@ -97,7 +97,7 @@ def test_render_and_persistence_never_rebuild_existing_view(tmp_path):
     tree.put(1, 0, "merged")
     assert view.render() == "<chat>\n0+1|first second\n1+1|later\n</chat>"
     view.save()
-    assert json.loads((tmp_path / "view.json").read_text()) == [[0, 0], [0, 1]]
+    assert json.loads((tmp_path / "view.json").read_text())["pairs"] == [[0, 0], [0, 1]]
     loaded = View(tree)
     assert loaded.render() == view.render()
     loaded.load()
@@ -158,3 +158,150 @@ def test_context_view_returns_fitting_view_unchanged(tmp_path):
     tree.put(0, 0, "short")
     view.add_root(0)
     assert view.context_view() == view.render()
+
+
+def test_context_boundary_survives_live_merges_and_later_requests(tmp_path):
+    tree = Tree(tmp_path)
+    view = View(tree, min_bytes=40, max_bytes=50)
+    for i in range(4):
+        tree.put(0, i, f"message-{i}")
+        view.add_root(i)
+    for i in range(2):
+        tree.put(1, i, f"pair-{i}")
+    tree.put(2, 0, "all four including the future")
+    view.merge_batch(4)
+    view.context_view(min_bytes=40, max_bytes=50, end=4)
+
+    # This boundary cuts inside the working compaction view's merged node.
+    context = view.context_view(min_bytes=40, max_bytes=50, end=1)
+    assert context == "<chat>\n0+1|message-0\n</chat>"
+    assert "future" not in context
+    assert view.context_view(min_bytes=40, max_bytes=50, end=1) == context
+
+
+def test_context_stops_at_first_hole_and_pins_bytes_across_restart(tmp_path):
+    tree = Tree(tmp_path)
+    view = View(tree)
+    for i in range(4):
+        view.add_root(i)
+    tree.put(0, 0, "before")
+    tree.put(0, 2, "after hole")
+    before = view.context_view(end=3)
+    assert before == "<chat>\n0+1|before\n</chat>"
+    tree.put(0, 1, "newly built")
+    tree.put(0, 3, "later")
+    after = view.context_view(end=4)
+    assert "newly built" in after
+    assert view.context_view(end=3) == before
+    tree.save()
+    view.save()
+    loaded = View(Tree(tmp_path))
+    assert loaded.context_view(end=3) == before
+    assert loaded.context_view(end=4) == after
+
+
+def test_pending_live_batch_resumes_below_ceiling_after_restart(tmp_path):
+    tree = Tree(tmp_path)
+    view = View(tree, min_bytes=40, max_bytes=110)
+    for i in range(4):
+        tree.put(0, i, "x" * 25)
+        view.add_root(i)
+    tree.put(1, 0, "a")
+    assert len(view.render().encode()) > view.max_bytes
+    view.merge_batch(4)
+    assert view.min_bytes < len(view.render().encode()) <= view.max_bytes
+    tree.save()
+    view.save()
+
+    tree = Tree(tmp_path)
+    view = View(tree, min_bytes=40, max_bytes=110)
+    tree.put(1, 1, "b")
+    view.merge_batch(4)
+    assert len(view.render().encode()) <= view.min_bytes
+    assert not view._batch_pending
+
+
+def test_compaction_batch_resumes_without_changing_pinned_request(tmp_path):
+    tree = Tree(tmp_path)
+    view = View(tree)
+    for i in range(4):
+        tree.put(0, i, "x" * 25)
+        view.add_root(i)
+    tree.put(1, 0, "a")
+    context = view.context_view(min_bytes=40, max_bytes=110, end=4)
+    assert 40 < len(context.encode()) <= 110
+    tree.save()
+    view.save()
+    tree = Tree(tmp_path)
+    view = View(tree)
+    tree.put(1, 1, "b")
+    view.merge_batch(4)
+    state = view._compaction_views[40, 110]
+    assert len(view._render(state.pairs).encode()) <= 40
+    assert not state.batch_pending
+    assert view.context_view(min_bytes=40, max_bytes=110, end=4) == context
+
+
+def test_load_legacy_pairs_without_rebuilding(tmp_path):
+    tree = Tree(tmp_path)
+    tree.put(0, 0, "first")
+    tree.put(0, 1, "second")
+    tree.put(1, 0, "merged")
+    (tmp_path / "view.json").write_text("[[0,0],[0,1]]")
+    view = View(tree)
+    assert [(line.l, line.i) for line in view.lines()] == [(0, 0), (0, 1)]
+
+
+def test_compaction_prefix_stays_stable_between_batches(tmp_path):
+    tree = Tree(tmp_path)
+    view = View(tree)
+    previous = "<chat>\n</chat>"
+    for i in range(6):
+        tree.put(0, i, "é" * 10)
+        view.add_root(i)
+        context = view.context_view(end=i + 1)
+        assert context.startswith(previous[:-7])
+        previous = context
+
+
+def test_targets_with_same_boundary_keep_independent_persisted_snapshots(tmp_path):
+    tree = Tree(tmp_path)
+    view = View(tree)
+    for i in range(3):
+        view.add_root(i)
+    root = view.context_view(target=(0, 2))
+    assert root == "<chat>\n</chat>"
+    tree.put(0, 0, "first")
+    tree.put(0, 1, "second")
+    merge = view.context_view(target=(1, 0))
+    assert merge == "<chat>\n0+1|first\n1+1|second\n</chat>"
+    assert view.context_view(target=(0, 2)) == root
+    tree.save()
+    view.save()
+    loaded = View(Tree(tmp_path))
+    assert loaded.context_view(target=(0, 2)) == root
+    assert loaded.context_view(target=(1, 0)) == merge
+
+
+def test_compaction_view_has_its_own_sawtooth(tmp_path):
+    tree = Tree(tmp_path)
+    view = View(tree)
+    previous = "<chat>\n</chat>"
+    batches = 0
+    for i in range(32):
+        tree.put(0, i, "é" * 10)
+        view.add_root(i)
+        l, index = 0, i
+        while index % 2:
+            l, index = l + 1, index // 2
+            tree.put(l, index, "merged")
+        appended_size = len(previous.encode()) + len(f"{i}+1|{'é' * 10}\n".encode())
+        context = view.context_view(min_bytes=100, max_bytes=200, end=i + 1)
+        if appended_size > 200:
+            batches += 1
+            assert len(context.encode()) <= 100
+        else:
+            assert context.startswith(previous[:-7])
+        assert len(view.lines()) == i + 1
+        previous = context
+    assert batches > 1

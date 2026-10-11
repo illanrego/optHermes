@@ -296,8 +296,14 @@ def test_selection_never_starts_a_model_call(tmp_path):
     in flight cannot be interrupted by the deadline. So it must not start one: anything
     needing a model is left to the background, and the view may hold a placeholder."""
     summarizer = FakeSummarizer()
-    engine = OptChatEngine(tmp_path, node_bytes=32, summarize=summarizer)
-    engine.on_turn_complete([{"role": "tool", "content": "x" * 80} for _ in range(9)])
+
+    def offline(request):
+        summarizer(request)
+        raise RuntimeError("offline")
+
+    engine = OptChatEngine(tmp_path, node_bytes=32, summarize=offline)
+    with pytest.warns(RuntimeWarning):
+        engine.on_turn_complete([{"role": "tool", "content": "x" * 80} for _ in range(9)])
     before = len(summarizer.prompts)
     assert not engine.view.settled()
 
@@ -310,14 +316,15 @@ def test_selection_never_starts_a_model_call(tmp_path):
 def test_end_of_turn_compaction_settles_the_view(tmp_path):
     """v1's admission is delivered by the end-of-turn background pass, not by the inline
     settle: after on_turn_complete the view has no placeholder, so the next turn starts
-    settled. The pass is bounded at 8 model nodes per turn."""
+    settled, including when more than eight model nodes were pending."""
     summarizer = FakeSummarizer()
     engine = OptChatEngine(tmp_path, node_bytes=32, summarize=summarizer)
-    engine.on_turn_complete([{"role": "tool", "content": "x" * 80}])
+    engine.on_turn_complete([{"role": "tool", "content": "x" * 80} for _ in range(12)])
 
     assert engine.tree.get(0, 0).text == "summary"
     assert engine.view.settled()
-    assert len(summarizer.prompts) == 1
+    assert len(summarizer.prompts) >= 12
+    assert all(engine.tree.get(0, i) is not None for i in range(12))
 
 
 def test_selection_serves_current_view_when_settle_raises(tmp_path, monkeypatch, caplog):

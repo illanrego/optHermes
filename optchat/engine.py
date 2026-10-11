@@ -275,6 +275,7 @@ class OptChatEngine(ContextEngine):
             # needs a model is built by the background run_pending after the turn.
             built = compactor.settle(max_nodes=max_nodes, timeout_s=timeout_s)
             tree.save()
+            view.save()
         except Exception:
             logger.exception("OptChat settle failed; serving the current view")
         logger.debug("OptChat settle built %d nodes; view settled: %s", built, view.settled())
