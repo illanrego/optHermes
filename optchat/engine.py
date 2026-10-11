@@ -23,6 +23,7 @@ inside Hermes inherits the real ABC. This binding is fixed at module import.
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import logging
 import os
@@ -42,6 +43,7 @@ except ModuleNotFoundError as exc:
 from .compactor import CompactionRequest, Compactor, Summarizer
 from .cache import plan_view_cache
 from .media import MEDIA_TYPES, archive_media, has_media_parts
+from .persistence import atomic_json
 from .prompts import SYSTEM_PROMPT
 from .store import Log
 from .text import split_for_kind
@@ -57,6 +59,19 @@ def default_root() -> Path:
     """Fallback chat directory when no constructor root or host home is supplied."""
     env = os.environ.get("HERMES_HOME")
     return (Path(env) if env else Path.home() / ".hermes") / "optchat"
+
+
+# How many recent host rows the ingestion checkpoint remembers. More than one,
+# because the host may rewrite the head of a transcript (compression) while the
+# recent rows stay byte-identical - the boundary is then still findable.
+CHECKPOINT_ROWS = 8
+
+
+def _row_fingerprint(message: dict[str, Any]) -> str:
+    """A stable identity for one host row: what it is, not when it arrived."""
+    stable = {key: message.get(key) for key in ("role", "content", "tool_calls", "tool_call_id")}
+    payload = json.dumps(stable, sort_keys=True, ensure_ascii=False, default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
 
 def _load_config(root: Path) -> dict[str, Any]:
@@ -132,7 +147,8 @@ class OptChatEngine(ContextEngine):
         self._warned_missing_tools = False
         self._turn_model: str | None = None
         self._warned_route_override = False
-        self._seen_messages = 0
+        self._session_id = ""
+        self._warned_ingest_boundary = False
         # Cron reads only; a child writes to its own chat after session start.
         self._writes = False
         self.last_prompt_tokens = 0
@@ -147,6 +163,7 @@ class OptChatEngine(ContextEngine):
         return "optchat"
 
     def on_session_start(self, session_id: str, **kwargs: Any) -> None:
+        self._session_id = session_id
         if "model" in kwargs:
             self._turn_model = kwargs["model"]
         self._check_compaction_route()
@@ -174,7 +191,6 @@ class OptChatEngine(ContextEngine):
                 return
             self.log = self.tree = self.view = self.compactor = None
             self._chat_root = child_root
-            self._seen_messages = 0
         elif self.log is not None:
             return
         self.log = Log(self._chat_root)
@@ -220,6 +236,41 @@ class OptChatEngine(ContextEngine):
             compactor.run_pending(limit=8, model_calls=False)
             tree.save()
             view.save()
+
+    def _checkpoint_path(self) -> Path:
+        return self._chat_root / "ingest.json"
+
+    def _load_checkpoint(self) -> dict[str, Any] | None:
+        """The stored ingestion boundary for this chat, or ``None``."""
+        try:
+            raw = json.loads(self._checkpoint_path().read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        if not isinstance(raw, dict) or raw.get("session") != self._session_id:
+            return None
+        rows, fingerprints = raw.get("rows"), raw.get("fingerprints")
+        if (not isinstance(rows, int) or rows < 0 or not isinstance(fingerprints, list)
+                or not all(isinstance(item, str) for item in fingerprints)):
+            return None
+        return {"rows": rows, "fingerprints": fingerprints}
+
+    def _resume_row(self, messages: list[dict[str, Any]],
+                    checkpoint: dict[str, Any] | None) -> int | None:
+        """The row to resume at, or ``None`` when the boundary cannot be found."""
+        if checkpoint is None:
+            return 0
+        known = set(checkpoint["fingerprints"])
+        if not known:
+            return checkpoint["rows"] if checkpoint["rows"] <= len(messages) else None
+        for row in range(min(len(messages), checkpoint["rows"]) - 1, -1, -1):
+            if _row_fingerprint(messages[row]) in known:
+                return row + 1
+        return None
+
+    def _save_checkpoint(self, rows: int, recent: list[str]) -> None:
+        atomic_json(self._checkpoint_path(),
+                    {"session": self._session_id, "rows": rows,
+                     "fingerprints": recent[-CHECKPOINT_ROWS:]})
 
     def _check_compaction_route(self) -> None:
         """Report an explicit aux route without changing the host's routing."""
@@ -459,10 +510,22 @@ class OptChatEngine(ContextEngine):
         log, tree, view, compactor = self._open()
         if not self._writes:
             return
-        # The host resends a transcript prefix. Count host rows, not log records:
-        # one assistant row can contain several tool calls or no visible text.
-        if len(messages) < self._seen_messages:
-            self._seen_messages = 0
+        # The host resends a transcript prefix. The boundary is found by row
+        # identity, not by a counter: a counter resets on restart (re-ingesting
+        # everything) and skips a transcript that happens to be the same length.
+        checkpoint = self._load_checkpoint()
+        start = self._resume_row(messages, checkpoint)
+        if start is None:
+            if not self._warned_ingest_boundary:
+                self._warned_ingest_boundary = True
+                warnings.warn(
+                    "OptChat cannot find its ingestion boundary in this transcript: the "
+                    "recorded rows are gone (a compression rewrote them). Ingesting nothing "
+                    "this turn rather than guessing a boundary that could duplicate history.",
+                    RuntimeWarning, stacklevel=2)
+            return
+        recent = [_row_fingerprint(messages[row])
+                  for row in range(max(0, start - CHECKPOINT_ROWS), start)]
         child_index = self._child_index() if self._chat_root == self.root else {}
         known_keys = set(child_index.values())
         tool_names: dict[str, str] = {}
@@ -475,7 +538,7 @@ class OptChatEngine(ContextEngine):
                         tool_names[call["id"]] = function["name"]
             call_id = message.get("tool_call_id") if message.get("role") == "tool" else None
             tool_name = tool_names.pop(call_id, None) if isinstance(call_id, str) else None
-            if row < self._seen_messages:
+            if row < start:
                 continue
             if tool_name == "delegate_task" and self._chat_root == self.root:
                 records = [("work", record, name, key) for name, record, key in
@@ -492,7 +555,10 @@ class OptChatEngine(ContextEngine):
                 if name is not None and key is not None:
                     child_index[name] = key
                     self._save_child_index(child_index)
-        self._seen_messages = len(messages)
+            # Advance only once every record of this row is durable, so a crash
+            # mid-row re-ingests that row instead of skipping its other records.
+            recent.append(_row_fingerprint(message))
+            self._save_checkpoint(row + 1, recent)
         # One save per turn, not per record: the log append is already fsync'd per
         # record, and the tree and view are derived state.
         tree.save()
@@ -531,7 +597,7 @@ class OptChatEngine(ContextEngine):
             self.log, self.tree, self.view, self.compactor)
         clone._chat_root = self._chat_root
         clone._master_view = self._master_view
-        clone._seen_messages = self._seen_messages
+        clone._session_id = self._session_id
         clone._writes = self._writes
         clone._turn_system = self._turn_system
         clone._turn_tools = self._turn_tools

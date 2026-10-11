@@ -471,3 +471,43 @@ still leave a live placeholder; host fail-closed admission remains outside WP4.
 
 Provider cache-hit measurements and auxiliary-route cache decoration remain
 unverified host work; local planning tests do not prove turn/compaction reuse.
+
+---
+
+# Revision 8 - durability and recovery (2026-10-11)
+
+WP6, four passes. The log is the source of truth; everything else is derived and recoverable.
+
+## The torn tail
+
+`optchat/persistence.py` (`read_jsonl`, `atomic_json`, `sync_directory`) is the shared rule for both
+append-only files. A line missing only its newline is a **complete record**: it is indexed and the
+file is made whole. An unparseable tail fragment is **sealed** with NUL + newline, so it can never
+parse later and is skipped on every subsequent load. Ordinary mid-file corruption **raises**, because
+record ids are the identity every other module keys on.
+
+## Duplicate ids
+
+`Log` rejects two records with the same id instead of keeping the first. First-wins was a silent
+loss: the later record was unreachable and the next append reused its id. `Tree` rejects a node
+written twice with **different** text (a build-once violation) and tolerates an identical duplicate,
+which is exactly what a crash between writing a node and dequeuing it produces.
+
+## Recovery at session start
+
+`OptChatEngine._recover()` reconciles the derived state with the log: every record without a level-0
+node is re-seeded **from the record itself** (so a long source is never stranded in memory), and the
+view is extended to cover every record beyond its end. The view is never rebuilt - a rebuilt view
+renders differently and kills every cache entry. Recovery does free work only; starting a session
+never waits on a model call.
+
+## The ingestion checkpoint
+
+`<chat_root>/ingest.json` = `{session, rows, fingerprints}`. The boundary is found by **row
+identity** (a hash of role, content, tool_calls, tool_call_id), not by a counter: a counter resets on
+restart (re-ingesting the whole transcript) and skips a transcript that happens to be the same
+length. `CHECKPOINT_ROWS` recent fingerprints are kept, so a rewritten tail is still findable. The
+checkpoint advances only after **all** records of a row are durable, so a crash mid-row re-ingests
+that row instead of skipping its remaining records. When no recorded row can be found - a
+compression rewrote the transcript - the engine ingests nothing and warns once, rather than guessing
+a boundary that could duplicate history.

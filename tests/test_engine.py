@@ -248,7 +248,10 @@ def test_ingestion_is_idempotent_and_clone_shares_store(tmp_path):
         ("user", "one"), ("unii", "two"), ("user", "three")]
     clone = engine.clone_for_agent()
     assert clone is not engine and clone.log is engine.log
-    clone.on_turn_complete([{"role": "user", "content": "from clone"}])
+    # The same session continuing: the boundary is found by row identity, so only
+    # the new row lands even though the clone re-sends the whole transcript.
+    clone.on_turn_complete(messages + [{"role": "user", "content": "three"},
+                                       {"role": "user", "content": "from clone"}])
     assert engine.log.get(3).text == "from clone"
     assert engine.should_compress() is False
     assert {schema["function"]["name"] for schema in engine.get_tool_schemas()} == {
@@ -570,3 +573,52 @@ def test_recovery_requeues_a_root_whose_source_was_only_in_memory(tmp_path):
     recovered.compactor.run_pending(limit=1)
     assert recovered.tree.get(0, index) is not None   # built from the recovered source
     recovered.log.close()
+
+
+def test_ingestion_resumes_across_a_restart_without_duplicating(tmp_path):
+    messages = [{"role": "user", "content": "one"}, {"role": "assistant", "content": "two"}]
+    engine = OptChatEngine(tmp_path, summarize=FakeSummarizer())
+    engine.on_session_start("session")
+    engine.on_turn_complete(messages)
+    assert engine.log.count() == 2
+    engine.log.close()
+
+    restarted = OptChatEngine(tmp_path, summarize=FakeSummarizer())
+    restarted.on_session_start("session")
+    restarted.on_turn_complete(messages)  # the same transcript, resent after a restart
+    assert restarted.log.count() == 2     # no duplicates
+
+    restarted.on_turn_complete(messages + [{"role": "user", "content": "three"}])
+    assert [record.text for record in restarted.log.range(0, 2)] == ["one", "two", "three"]
+    restarted.log.close()
+
+
+def test_ingestion_resumes_at_the_right_row_after_a_changed_tail(tmp_path):
+    messages = [{"role": "user", "content": "one"}, {"role": "assistant", "content": "two"}]
+    engine = OptChatEngine(tmp_path, summarize=FakeSummarizer())
+    engine.on_session_start("session")
+    engine.on_turn_complete(messages)
+    engine.log.close()
+
+    # Same length, last row rewritten: the boundary is found one row earlier, so the
+    # new text is ingested instead of the whole transcript being skipped.
+    changed = [messages[0], {"role": "assistant", "content": "TWO"}]
+    restarted = OptChatEngine(tmp_path, summarize=FakeSummarizer())
+    restarted.on_session_start("session")
+    restarted.on_turn_complete(changed)
+    assert [record.text for record in restarted.log.range(0, 2)] == ["one", "two", "TWO"]
+    restarted.log.close()
+
+
+def test_unfindable_boundary_ingests_nothing_and_warns(tmp_path):
+    engine = OptChatEngine(tmp_path, summarize=FakeSummarizer())
+    engine.on_session_start("session")
+    engine.on_turn_complete([{"role": "user", "content": "one"}])
+    engine.log.close()
+
+    restarted = OptChatEngine(tmp_path, summarize=FakeSummarizer())
+    restarted.on_session_start("session")
+    with pytest.warns(RuntimeWarning, match="cannot find its ingestion boundary"):
+        restarted.on_turn_complete([{"role": "user", "content": "something else entirely"}])
+    assert restarted.log.count() == 1  # nothing guessed, nothing duplicated
+    restarted.log.close()
