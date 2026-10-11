@@ -1,6 +1,25 @@
 """Split logged text into UTF-8 byte-bounded messages."""
 
 
+def kind_prefix(kind: str) -> str:
+    """The ``{kind}: `` tag a seeded node carries (the spec's level-0 <input> form)."""
+    return f"{kind}: "
+
+
+def split_for_kind(text: str, max_bytes: int, kind: str) -> list[str]:
+    """Split so every chunk still fits ``max_bytes`` once tagged with ``kind: ``.
+
+    A node's text is ``{kind}: {text}`` and that whole string is what the byte
+    budget measures, so the raw text must be split by the remaining budget. Split
+    by the full budget instead and no chunk would ever fit, so every message would
+    need a model call.
+    """
+    budget = max_bytes - len(kind_prefix(kind).encode("utf-8"))
+    if budget <= 0:
+        raise ValueError("max_bytes must exceed the kind tag")
+    return split_text(text, budget)
+
+
 def split_text(text: str, max_bytes: int) -> list[str]:
     """Preserve all text while preferring a late whitespace boundary."""
     if max_bytes <= 0:

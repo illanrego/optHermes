@@ -18,34 +18,61 @@ def test_seed_short_is_free_and_long_uses_one_call(tmp_path):
         return "short"
 
     compactor = Compactor(tree, summarize, node_bytes=8)
-    compactor.seed(0, "éééé")
-    assert tree.get(0, 0).text == "éééé"
+    compactor.seed(0, "é", "user")
+    assert tree.get(0, 0).text == "user: é"
+    assert tree.get(0, 0).size == len("user: é".encode("utf-8")) == 8
     assert prompts == []
-    compactor.seed(1, "ééééé")
+    compactor.seed(1, "éé", "user")
     assert tree.get(0, 1) is None
     assert compactor.run_pending(limit=1) == 1
     assert tree.get(0, 1).text == "short"
     assert len(prompts) == 1
     assert "--------" in prompts[0].task
+    assert "<input>\nuser: éé\n</input>" in prompts[0].task
+
+
+def test_kind_prefix_pushes_source_over_free_node_limit(tmp_path):
+    tree = Tree(tmp_path, node_bytes=10)
+    requests = []
+    compactor = Compactor(tree, lambda request: requests.append(request) or "short",
+                          node_bytes=10)
+
+    compactor.seed(0, "hello", "user")
+
+    assert tree.get(0, 0) is None
+    assert compactor.run_pending(limit=1, model_calls=False) == 0
+    assert compactor.run_pending(limit=1) == 1
+    assert "<input>\nuser: hello\n</input>" in requests[0].task
+
+
+def test_seed_requires_explicit_kind(tmp_path):
+    compactor = Compactor(Tree(tmp_path), lambda _request: "summary")
+    with pytest.raises(TypeError, match="kind"):
+        compactor.seed(0, "hello")
 
 
 def test_free_parent_and_long_parent(tmp_path):
-    tree = Tree(tmp_path, node_bytes=10)
+    tree = Tree(tmp_path, node_bytes=16)
     calls = []
-    compactor = Compactor(tree, lambda prompt: calls.append(prompt) or "merged", node_bytes=10)
-    compactor.seed(0, "a")
-    compactor.seed(1, "b")
+    compactor = Compactor(tree, lambda prompt: calls.append(prompt) or "merged", node_bytes=16)
+    compactor.seed(0, "a", "user")
+    compactor.seed(1, "b", "user")
     assert compactor.run_pending(limit=1) == 1
-    assert tree.get(1, 0).text == "a\nb"
+    assert tree.get(1, 0).text == "user: a\nuser: b"
     assert calls == []
-    compactor.seed(2, "12345")
-    compactor.seed(3, "67890")
+    compactor.seed(2, "12345", "user")
+    compactor.seed(3, "67890", "user")
     assert compactor.run_pending(limit=1) == 1
     assert tree.get(1, 1).text == "merged"
     assert len(calls) == 1
+    assert "merge lines 2+1 and 3+1, adjacent" in calls[0].task
+    assert "their messages, 2 to 3, in more detail" in calls[0].task
+    assert "<input>\nuser: 12345\nuser: 67890\n</input>" in calls[0].task
     assert tree.get(2, 0) is None
     assert compactor.run_pending(limit=1) == 1
     assert tree.get(2, 0) is not None
+    assert "merge lines 0+2 and 2+2, adjacent" in calls[1].task
+    assert "their messages, 0 to 3, in more detail" in calls[1].task
     assert all(tree.get(*child) for child in tree.children(2, 0))
 
 
@@ -59,7 +86,7 @@ def test_oversize_retry_keeps_shortest(tmp_path):
         return next(replies)
 
     compactor = Compactor(tree, summarize, node_bytes=8)
-    compactor.seed(0, "long source")
+    compactor.seed(0, "long source", "user")
     assert compactor.run_pending(limit=1) == 1
     assert tree.get(0, 0).text == "short"
     assert len(prompts) == 2
@@ -72,7 +99,7 @@ def test_oversize_retry_keeps_shortest(tmp_path):
 def test_failed_summary_is_reported_and_unbuilt(tmp_path, summarize):
     tree = Tree(tmp_path, node_bytes=4)
     compactor = Compactor(tree, summarize, node_bytes=4)
-    compactor.seed(0, "too long")
+    compactor.seed(0, "too long", "user")
     with pytest.warns(RuntimeWarning):
         assert compactor.run_pending(limit=1) == 0
     assert tree.get(0, 0) is None
@@ -101,7 +128,7 @@ def test_four_independent_summaries_run_at_once(tmp_path):
 
     compactor = Compactor(tree, summarize, node_bytes=8)
     for i in range(4):
-        compactor.seed(i, "long source")
+        compactor.seed(i, "long source", "user")
 
     assert compactor.run_pending(limit=4) == 4, "Four calls must meet the 5-second barrier"
     assert maximum_active == 4
@@ -114,7 +141,7 @@ def test_limit_does_not_change_the_built_nodes(tmp_path):
         tree = Tree(tmp_path / str(limit), node_bytes=6)
         compactor = Compactor(tree, lambda _request: "abcd", node_bytes=6)
         for i in range(4):
-            compactor.seed(i, "long source")
+            compactor.seed(i, "long source", "user")
         assert sum(compactor.run_pending(limit=limit) for _ in range(7)) == 7
         snapshots.append(tree.nodes())
 
@@ -135,7 +162,7 @@ def test_one_pass_builds_the_same_nodes_regardless_of_finish_order(tmp_path):
 
         compactor = Compactor(tree, summarize, node_bytes=6)
         for i in range(4):
-            compactor.seed(i, "long source")
+            compactor.seed(i, "long source", "user")
         assert compactor.run_pending(limit=5) == 5
         snapshots.append(tree.nodes())
 
@@ -149,10 +176,12 @@ def test_parent_request_follows_both_child_requests(tmp_path):
     lock = threading.Lock()
 
     def summarize(request):
-        merge = re.search(r"merge the two lines under (\d+)\+(\d+)", request.task)
+        merge = re.search(r"merge lines (\d+)\+(\d+) and (\d+)\+(\d+), adjacent",
+                          request.task)
         if merge:
-            start, count = map(int, merge.groups())
-            key = (count.bit_length() - 1, start // count)
+            start, count, right, right_count = map(int, merge.groups())
+            assert (right, right_count) == (start + count, count)
+            key = (count.bit_length(), start // (2 * count))
             assert all(tree.get(*child) is not None for child in tree.children(*key))
         else:
             message = re.search(r"compress message (\d+)", request.task)
@@ -164,7 +193,7 @@ def test_parent_request_follows_both_child_requests(tmp_path):
 
     compactor = Compactor(tree, summarize, node_bytes=6)
     for i in range(4):
-        compactor.seed(i, "long source")
+        compactor.seed(i, "long source", "user")
     assert sum(compactor.run_pending(limit=4) for _ in range(3)) == 7
 
     for parent in ((1, 0), (1, 1), (2, 0)):
@@ -181,7 +210,7 @@ def test_concurrent_summary_failure_leaves_only_affected_child_unbuilt(tmp_path)
 
     compactor = Compactor(tree, summarize, node_bytes=6)
     for i in range(4):
-        compactor.seed(i, "long source")
+        compactor.seed(i, "long source", "user")
     with pytest.warns(RuntimeWarning, match="offline"):
         compactor.run_pending(limit=4)
     assert tree.get(0, 0) is None
@@ -190,14 +219,14 @@ def test_concurrent_summary_failure_leaves_only_affected_child_unbuilt(tmp_path)
 
 
 def test_unready_parent_waits_for_both_children(tmp_path):
-    tree = Tree(tmp_path, node_bytes=4)
-    compactor = Compactor(tree, lambda _prompt: "done", node_bytes=4)
+    tree = Tree(tmp_path, node_bytes=10)
+    compactor = Compactor(tree, lambda _prompt: "done", node_bytes=10)
     compactor.submit(1, 0)
     assert compactor.run_pending() == 0
-    compactor.seed(0, "long source")
+    compactor.seed(0, "long source", "user")
     assert compactor.run_pending(limit=1) == 1
     assert tree.get(1, 0) is None
-    compactor.seed(1, "yes")
+    compactor.seed(1, "yes", "user")
     assert compactor.run_pending(limit=1) == 1
     assert tree.get(1, 0) is not None
 
@@ -219,7 +248,7 @@ def test_request_carries_turn_prefix_context_and_task(tmp_path):
                           node_bytes=8, view=view)
     compactor.system = "turn system"
     compactor.tools = [{"type": "function", "function": {"name": "lookup"}}]
-    compactor.seed(0, "long source")
+    compactor.seed(0, "long source", "user")
     view.add_root(0)
 
     assert compactor.run_pending(limit=1) == 1
@@ -228,7 +257,7 @@ def test_request_carries_turn_prefix_context_and_task(tmp_path):
     assert request.context.startswith("<chat>\n0+1|")
     assert request.context.endswith("</chat>")
     assert "Compaction: compress message 0" in request.task
-    assert "long source" in request.task
+    assert "<input>\nuser: long source\n</input>" in request.task
     assert request.tools == compactor.tools
 
 
@@ -244,7 +273,7 @@ def test_retry_only_changes_task_and_failure_leaves_node_unbuilt(tmp_path):
         raise RuntimeError("offline")
 
     compactor = Compactor(tree, summarize, node_bytes=8, view=view)
-    compactor.seed(0, "long source")
+    compactor.seed(0, "long source", "user")
     view.add_root(0)
     with pytest.warns(RuntimeWarning, match="offline"):
         assert compactor.run_pending(limit=1) == 0
@@ -262,7 +291,7 @@ def test_settle_default_builds_only_free_nodes(tmp_path):
     and a short message's node is free at seed time - so the only work settle can do is a
     free parent elsewhere in the tree.
     """
-    tree = Tree(tmp_path, node_bytes=8)
+    tree = Tree(tmp_path, node_bytes=16)
     view = View(tree)
     calls = []
 
@@ -270,19 +299,19 @@ def test_settle_default_builds_only_free_nodes(tmp_path):
         calls.append(1)
         return "short"
 
-    compactor = Compactor(tree, summarize, node_bytes=8, view=view)
-    compactor.seed(0, "long source")   # needs a model
+    compactor = Compactor(tree, summarize, node_bytes=16, view=view)
+    compactor.seed(0, "long source", "user")   # needs a model
     view.add_root(0)
-    compactor.seed(1, "long source")   # needs a model
+    compactor.seed(1, "long source", "user")   # needs a model
     view.add_root(1)
-    compactor.seed(2, "a")             # free, and its pair with 3 is a free parent
+    compactor.seed(2, "a", "user")             # free, and its pair with 3 is a free parent
     view.add_root(2)
-    compactor.seed(3, "b")
+    compactor.seed(3, "b", "user")
     view.add_root(3)
 
     assert not view.settled()
     assert compactor.settle() == 1
-    assert tree.get(1, 1).text == "a\nb"
+    assert tree.get(1, 1).text == "user: a\nuser: b"
     assert tree.get(0, 0) is None      # the model nodes are deferred
     assert calls == []                 # no model call was started
     assert not view.settled()
@@ -292,7 +321,7 @@ def test_settle_with_model_calls_settles_the_whole_view(tmp_path):
     tree = Tree(tmp_path, node_bytes=8)
     view = View(tree)
     compactor = Compactor(tree, lambda _request: "short", node_bytes=8, view=view)
-    compactor.seed(0, "long source")
+    compactor.seed(0, "long source", "user")
     view.add_root(0)
 
     assert compactor.settle(model_calls=True) == 1
@@ -305,7 +334,7 @@ def test_settle_stops_at_max_nodes(tmp_path):
     view = View(tree)
     compactor = Compactor(tree, lambda _request: "short", node_bytes=8, view=view)
     for i in range(3):
-        compactor.seed(i, "long source")
+        compactor.seed(i, "long source", "user")
         view.add_root(i)
 
     assert compactor.settle(max_nodes=1, model_calls=True) == 1
@@ -325,7 +354,7 @@ def test_settle_stops_after_deadline(tmp_path):
 
     compactor = Compactor(tree, summarize, node_bytes=8, view=view)
     for i in range(3):
-        compactor.seed(i, "long source")
+        compactor.seed(i, "long source", "user")
         view.add_root(i)
 
     assert compactor.settle(timeout_s=0.005, model_calls=True) == 1
@@ -343,7 +372,7 @@ def test_settle_does_not_retry_a_deferred_failure_in_one_call(tmp_path):
         raise RuntimeError("offline")
 
     compactor = Compactor(tree, summarize, node_bytes=8, view=view)
-    compactor.seed(0, "long source")
+    compactor.seed(0, "long source", "user")
     view.add_root(0)
     with pytest.warns(RuntimeWarning, match="offline"):
         assert compactor.settle(model_calls=True) == 0

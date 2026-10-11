@@ -37,7 +37,7 @@ from .compactor import CompactionRequest, Compactor, Summarizer
 from .media import MEDIA_TYPES, archive_media, has_media_parts
 from .prompts import SYSTEM_PROMPT
 from .store import Log
-from .text import split_text
+from .text import split_for_kind
 from .tree import Tree
 from .view import View
 from . import tools as opt_tools
@@ -266,8 +266,8 @@ class OptChatEngine(ContextEngine):
                  tool_name: str | None = None) -> list[tuple[str, str]]:
         role = message.get("role")
         if role == "user":
-            return [("user", chunk) for chunk in split_text(
-                _content_text(message.get("content")), node_bytes)]
+            return [("user", chunk) for chunk in split_for_kind(
+                _content_text(message.get("content")), node_bytes, "user")]
         if role == "tool":
             text = _content_text(message.get("content"))
             name = _delegate_name(text) if tool_name == "delegate_task" else None
@@ -295,7 +295,7 @@ class OptChatEngine(ContextEngine):
             return records
         if role == "assistant":
             content = _content_text(message.get("content"))
-            return ([("unii", chunk) for chunk in split_text(content, node_bytes)]
+            return ([("unii", chunk) for chunk in split_for_kind(content, node_bytes, "unii")]
                     if content or has_media_parts(message.get("content")) else [])
         return []
 
@@ -411,7 +411,7 @@ class OptChatEngine(ContextEngine):
                 index = log.append(kind, text)
                 if record_index == 0:
                     archive_media(self._chat_root, index, message.get("content"))
-                compactor.seed(index, text)
+                compactor.seed(index, text, kind)
                 view.add_root(index)
                 if name is not None and key is not None:
                     child_index[name] = key

@@ -157,7 +157,7 @@ def test_delegate_result_name_fallback_and_field_priority():
         ("work", "[subagent] plain report")]
 
 
-def test_long_user_message_is_logged_as_consecutive_free_records(tmp_path):
+def test_long_user_message_keeps_raw_log_and_tags_tree_sources(tmp_path):
     summarizer = FakeSummarizer()
     engine = OptChatEngine(tmp_path, node_bytes=32, summarize=summarizer)
     text = "one two three four five six seven eight nine ten eleven twelve"
@@ -167,8 +167,15 @@ def test_long_user_message_is_logged_as_consecutive_free_records(tmp_path):
     assert len(records) > 1
     assert all(record.kind == "user" and record.size <= 32 for record in records)
     assert "".join(chunks).split() == text.split()
-    assert all(engine.tree.get(0, record.id).text == record.text for record in records)
-    assert not any("compress message" in prompt.task for prompt in summarizer.prompts)
+    for record in records:
+        source = f"{record.kind}: {record.text}"
+        node = engine.tree.get(0, record.id)
+        if len(source.encode("utf-8")) <= 32:
+            assert node.text == source
+            assert node.size == len(source.encode("utf-8"))
+        else:
+            assert any(f"<input>\n{source}\n</input>" in prompt.task
+                       for prompt in summarizer.prompts)
 
 
 def test_long_assistant_text_splits_but_tool_result_keeps_its_clip(tmp_path):

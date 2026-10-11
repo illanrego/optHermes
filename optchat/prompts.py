@@ -8,10 +8,8 @@ compaction instructions) followed by the task template, and ``tools`` are the sa
 a turn sends. The spec delivers the instructions as a system prompt and the task
 separately; carrying both in ``task`` is the same information.
 
-Deviations from the gist, deliberate and small: the level-0 task omits the
-``{kind}:`` prefix (the source text is the message itself, and the rubric already
-asks for kind tags), and the merge task names the node by ``{id}+{count}`` instead
-of the two child line names.
+The task templates follow the spec verbatim. The level-0 ``<input>`` is the
+kind-prefixed message, and the byte limit and ruler are parameterised.
 """
 
 SYSTEM_PROMPT = """The view is the whole chat, oldest first, inside <chat> tags, with one line per node. A line has the form id+n|text: it covers the n messages from id on, with newlines shown as spaces. A line can contain user, unii, tool, echo, work, or note messages. A message not summarized yet appears as (not summarized yet: zoom it). The view is your memory, and its latest word on a thing is the truth.
@@ -44,9 +42,11 @@ COMPACTION_TASK = """Compaction: compress message {id} into one line of at most 
 {input}
 </input>"""
 
-COMPACTION_MERGE_TASK = """Compaction: merge the two lines under {id}+{count} into one line of at most {node_bytes} bytes (about 70 words), the length of this ruler:
+COMPACTION_MERGE_TASK = """Compaction: merge lines {a} and {b}, adjacent, into one line of at most
+{node_bytes} bytes (about 70 words), the length of this ruler:
 {ruler}
-<chat> may hold their messages in more detail: take details of them from there too.
+<chat> may hold their messages, {id} to {end}, in more detail: take details
+of them from there too.
 <input>
 {input}
 </input>"""

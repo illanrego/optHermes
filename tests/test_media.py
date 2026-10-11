@@ -23,7 +23,7 @@ def _image(raw: bytes) -> dict:
 
 def test_image_is_archived_and_kept_out_of_log_view_and_compaction(tmp_path):
     summarizer = RecordingSummarizer()
-    engine = OptChatEngine(tmp_path, node_bytes=16, summarize=summarizer)
+    engine = OptChatEngine(tmp_path, node_bytes=32, summarize=summarizer)
     image = b"image bytes for archival"
     encoded = base64.b64encode(image).decode("ascii")
     engine.on_turn_complete([{"role": "user", "content": [

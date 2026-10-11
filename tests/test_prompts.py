@@ -31,7 +31,8 @@ def test_compaction_system_carries_the_rubric_and_the_data_rule():
 
 def test_compaction_templates_render_with_the_compactor_placeholders():
     for template in (COMPACTION_TASK, COMPACTION_MERGE_TASK):
-        prompt = template.format(id=0, count=2, node_bytes=9, ruler="-" * 9, input="input")
+        prompt = template.format(id=0, end=1, a="0+1", b="1+1",
+                                 node_bytes=9, ruler="-" * 9, input="input")
         lines = prompt.splitlines()
         assert "-" * 9 in lines
         # The input block opens after the ruler (the merge task has a <chat> hint line
@@ -39,7 +40,22 @@ def test_compaction_templates_render_with_the_compactor_placeholders():
         assert "<input>" in lines[lines.index("-" * 9):]
         assert "input" in prompt
         assert "</input>" in prompt
-        assert "at most 9 bytes" in prompt
+        assert "at most" in prompt
+        assert "9 bytes" in prompt
+
+
+def test_merge_task_matches_spec_wording_and_line_breaks():
+    rendered = COMPACTION_MERGE_TASK.format(
+        a="40+4", b="44+4", id=40, end=47, node_bytes=512,
+        ruler="-" * 512, input="left line\nright line")
+    assert rendered == (
+        "Compaction: merge lines 40+4 and 44+4, adjacent, into one line of at most\n"
+        "512 bytes (about 70 words), the length of this ruler:\n"
+        + "-" * 512 + "\n"
+        "<chat> may hold their messages, 40 to 47, in more detail: take details\n"
+        "of them from there too.\n"
+        "<input>\nleft line\nright line\n</input>"
+    )
 
 
 def test_rubric_priority_order():

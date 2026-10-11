@@ -16,7 +16,7 @@ def test_zoom_whole_message_and_two_halves(tmp_path):
         compactor = Compactor(tree, lambda prompt: "short summary")
         for text in ("first message", "second message"):
             index = log.append("user", text)
-            compactor.seed(index, text)
+            compactor.seed(index, text, "user")
             view.add_root(index)
         compactor.run_pending()
 
@@ -25,7 +25,7 @@ def test_zoom_whole_message_and_two_halves(tmp_path):
         assert whole["media"] == []
         halves = json.loads(zoom(log, tree, view, 0, 2))["halves"]
         assert [(half["id"], half["n"], half["text"]) for half in halves] == [
-            (0, 1, "first message"), (1, 1, "second message")]
+            (0, 1, "user: first message"), (1, 1, "user: second message")]
 
 
 def test_zoom_rejects_bad_coordinates_and_date_is_stored(tmp_path):
@@ -45,7 +45,7 @@ def test_zoom_child_chat_and_invalid_names(tmp_path):
         child_tree = Tree(child_root)
         child_view = View(child_tree)
         index = child_log.append("user", "child task")
-        Compactor(child_tree, lambda prompt: "summary").seed(index, "child task")
+        Compactor(child_tree, lambda prompt: "summary").seed(index, "child task", "user")
         child_view.add_root(index)
         child_tree.save()
         child_view.save()
@@ -61,6 +61,6 @@ def test_zoom_child_chat_and_invalid_names(tmp_path):
         assert whole["media"] == []
         result = json.loads(zoom(master_log, master_tree, master_view, "Researcher"))
         assert result["name"] == "Researcher"
-        assert result["chat"] == "<chat>\n0+1|child task\n</chat>"
+        assert result["chat"] == "<chat>\n0+1|user: child task\n</chat>"
         assert "error" in json.loads(zoom(master_log, master_tree, master_view, "Unknown"))
         assert "error" in json.loads(zoom(master_log, master_tree, master_view, 1.5))

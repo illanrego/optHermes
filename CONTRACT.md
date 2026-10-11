@@ -78,7 +78,7 @@ Summarizer = Callable[[str], str]                       # injected: prompt -> on
 class Compactor:
     def __init__(self, tree: Tree, summarize: Summarizer, *,
                  node_bytes: int = NODE_BYTES, max_retries: int = COMPACT_MAX_RETRIES)
-    def seed(self, i: int, text: str) -> None           # register message i as node(0, i)
+    def seed(self, i: int, text: str, kind: str) -> None   # register message i as node(0, i)
     def submit(self, l: int, i: int) -> None
     def run_pending(self, limit: int = COMPACT_CONCURRENCY) -> int   # nodes built; sequential in v1
 ```
@@ -88,9 +88,10 @@ the record ids is a different thing: `Log` raises `ValueError` rather than silen
 re-indexing, because ids are the identity every other module keys on. Mid-file
 corruption should be loud.
 
-**`seed` is the only way roots appear.** `Tree` starts empty; `Compactor.seed(i, text)`
-registers message `i`, putting it as `node(0, i)` when it fits in `NODE_BYTES` (free, no
-model call) and leaving it unbuilt when it does not (the model compresses it). Nothing
+**`seed` is the only way roots appear.** `Tree` starts empty; `Compactor.seed(i, text, kind)`
+registers message `i`, putting it as `node(0, i)` when its kind-prefixed text (`{kind}: {text}`,
+the spec's level-0 `<input>` form) fits in `NODE_BYTES` (free, no model call) and leaving it
+unbuilt when it does not (the model compresses it). Nothing
 else creates level-0 nodes.
 
 ### `select_context` (the crux)

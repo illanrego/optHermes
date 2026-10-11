@@ -105,7 +105,7 @@ def test_reasoning_only_reply_raises_and_compactor_leaves_node_unbuilt(monkeypat
 
     tree = Tree(tmp_path, node_bytes=8)
     compactor = Compactor(tree, summarize, node_bytes=8)
-    compactor.seed(0, "a source that needs a summary")
+    compactor.seed(0, "a source that needs a summary", "user")
     with pytest.warns(RuntimeWarning, match="empty reply"):
         assert compactor.run_pending() == 0
     assert tree.get(0, 0) is None

@@ -2,7 +2,7 @@
 
 from .compactor import Compactor
 from .store import Log
-from .text import split_text
+from .text import split_for_kind
 from .view import View
 
 
@@ -13,9 +13,9 @@ def import_notes(log: Log, compactor: Compactor, view: View, texts: list[str]) -
     """
     appended = 0
     for text in texts:
-        for chunk in split_text(text, compactor.node_bytes):
+        for chunk in split_for_kind(text, compactor.node_bytes, "note"):
             index = log.append("note", chunk)
-            compactor.seed(index, chunk)
+            compactor.seed(index, chunk, "note")
             view.add_root(index)
             appended += 1
     if appended:

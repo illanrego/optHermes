@@ -45,16 +45,18 @@ class Compactor:
         for key in tree.buildable():
             self.submit(*key)
 
-    def seed(self, i: int, text: str) -> None:
-        if not isinstance(i, int) or i < 0 or not isinstance(text, str):
-            raise ValueError("A seed needs a nonnegative id and text")
+    def seed(self, i: int, text: str, kind: str) -> None:
+        if (not isinstance(i, int) or i < 0 or not isinstance(text, str)
+                or not isinstance(kind, str) or not kind):
+            raise ValueError("A seed needs a nonnegative id, text, and kind")
         if self.tree.get(0, i) is not None or i in self._sources:
             raise ValueError(f"Message {i} was already seeded")
-        if len(text.encode("utf-8")) <= self.node_bytes:
-            self.tree.put(0, i, text)
+        source = f"{kind}: {text}"
+        if len(source.encode("utf-8")) <= self.node_bytes:
+            self.tree.put(0, i, source)
             self._submit_ready_parent(0, i)
         else:
-            self._sources[i] = text
+            self._sources[i] = source
             self.submit(0, i)
 
     def submit(self, l: int, i: int) -> None:
@@ -84,7 +86,12 @@ class Compactor:
                 return None
             source = left.text + "\n" + right.text
             template = COMPACTION_MERGE_TASK
-        task = template.format(id=i << l, count=1 << l, node_bytes=self.node_bytes,
+        first = i << l
+        child_count = 1 << (l - 1) if l else 0
+        task = template.format(id=first, end=first + (1 << l) - 1,
+                               a=f"{first}+{child_count}",
+                               b=f"{first + child_count}+{child_count}",
+                               node_bytes=self.node_bytes,
                                ruler="-" * self.node_bytes, input=source)
         return CompactionRequest(
             system=self.system,
