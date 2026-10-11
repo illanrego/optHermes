@@ -552,27 +552,6 @@ idempotent. The host half (a delegate result carrying `child_session_id`) remain
 
 ---
 
-# Revision 12 - a duplicate name leaves the new report addressable (2026-10-11)
-
-P6b. This supersedes revision 9's sentence that a conflicting name "keeps its first
-mapping and warns once": the first mapping is still kept, but the new report no longer
-carries the taken name.
-
-- A delegate result whose name is already mapped to a different child receives the
-  first free suffixed label (`"Name 2"`, `"Name 3"`, ..., incrementing until free),
-  chosen by probing the persisted `<root>/agents/index.json`, and that label is what
-  the work record carries (`[Researcher 2] ...`) and what the index maps
-  (`"Researcher 2" -> child`). The name the model reads in a record is the name it can
-  zoom by (revision 3).
-- The original name stays mapped to the first child as an alias, so older labels keep
-  working; a mapping is never overwritten.
-- A label already mapped to the same child is reused rather than replaced, so a
-  child's label is stable across turns and restarts: it lives in the index, not in
-  memory. The conflict still warns once per name, per engine.
-- Registration happens when a result is resolved (at selection for the running turn,
-  or at ingestion), before the record text is built, so the record and the index can
-  never disagree about the label.
-
 # Structural rules - laws enforced by absence (2026-10-11)
 
 A law that must hold is enforced by **absence**, not by instruction. A prompt line is a preference
@@ -734,3 +713,25 @@ never from the log - and records `"recovered": true` in `view.json` so a later l
 see that the recovery happened. `View(tree, min_bytes, max_bytes, records=...)` takes the
 owner's record count; the engine passes `log.count()`, and a foreign read passes nothing.
 The version-2 object gains that boolean.
+
+---
+
+# Revision 13 - a duplicate name leaves the new report addressable (2026-10-11)
+
+P6b, Plan Order 4. This supersedes revision 9's sentence that a conflicting name "keeps its first
+mapping and warns once": the first mapping is still kept, but the new report no longer carries the
+taken name.
+
+- A delegate result whose name is already mapped to a different child receives the first free
+  suffixed label (`"Name 2"`, `"Name 3"`, ..., incrementing until free), chosen by probing the
+  persisted `<root>/agents/index.json`. That label is what the work record carries
+  (`[Researcher 2] ...`) and what the index maps (`"Researcher 2" -> child`): the name the model
+  reads in a record is the name it can zoom by (revision 3).
+- The original name stays mapped to the first child as an alias, so older labels keep working; a
+  mapping is never overwritten.
+- A label already mapped to the same child is reused rather than replaced, so a child's label is
+  stable across turns and restarts: it lives in the index, not in memory. The conflict still warns
+  once per name, per engine.
+- Registration happens when a result is resolved - at selection for the running turn, or at
+  ingestion - before the record text is built, so the record and the index can never disagree about
+  the label.
