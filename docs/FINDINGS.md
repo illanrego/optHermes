@@ -21,8 +21,9 @@ below is **not yet implemented** as of this file.
 | WP5 | #1, #7 | provider-aware cache planning (cache) | astra @ high | DONE (e103aa2) |
 | WP5b | (WP5 follow-up) | group the view's cache blocks 4 lines at a time | sol @ high | DONE (af62f01) |
 | WP6 | #10, #11, #12, tree tail | ingestion identity and recovery | by hand (codex limit) | DONE (acebbcd) |
-| WP7 | #14, #15 | child identity and navigation | sol @ high | TODO |
-| WP8 | #6, #17, #20 | prompt volatility, media envelope, host fallback | sol @ high | TODO |
+| WP7 | #14, #15 | child identity and navigation | sol @ high | DONE (030fc2e) |
+| WP8 | #6, #17, #20 | prompt volatility, media envelope, host fallback | sol @ high | RUNNING |
+| WP9 | (seam wiring) | use the three host seams: tools for compactions, refusal for admission, per-message for live logging | TODO | TODO |
 
 Order and why: **WP1** first (the turn-boundary bug is the most urgent active-turn defect and
 the other two are tiny); **WP2** before sustained compaction (a node is immutable, so unlabelled
@@ -128,15 +129,28 @@ code first.
   compaction also touches `summary_target_ratio`, which we do not define. Host-side, but the
   engine should fail loudly rather than silently lose its guarantee.
 
-## Upstream (not code here)
+## Upstream (built locally, not PR'd)
+
+Three additive seams are implemented on branch `feat/context-engine-seams` in the seam worktree
+(commit `cf1743d63a`), all in the same shape as the `cache_plan` seam:
+
+- **tools to `select_context`** (#2's host half) - a deep copy of the request's outgoing schemas, so
+  a compaction can be assembled like a turn on a route where no cache-plan hook fires.
+- **`ContextSelectionBlocked`** (#8's host half) - an engine can refuse a request it cannot serve
+  yet; the host re-assembles once, then sends the original messages with a warning.
+- **`on_message`** (#10's host half) - a per-append observation hook, so an engine can log as things
+  happen instead of waiting for the turn boundary.
+
+Nothing is PR'd: on the user's instruction, nothing goes upstream until it has been tested on his
+terms.
+
+Still upstream, not built:
 
 - **The toolset gate (#16)** an active engine whose navigation tools are unreachable: the host adds
   `context_engine` to `enabled_toolsets` only when resolution keeps it, and in the one-shot path
   it does not. Workaround `-t context_engine`. Worth its own defect issue.
 - **The auxiliary path** does not run the conversation-loop planner, so a compaction cannot share
   a turn's plan even with identical intent.
-- **Blocking selection (#8, host half)** the host catches ordinary exceptions and sends the
-  original request, so admission cannot fail closed.
 - **Child identity in results (#15, host half)** include the child session id in every completed
   result entry.
 - **The multimodal envelope (#17, host half)** let engine tools return media.
