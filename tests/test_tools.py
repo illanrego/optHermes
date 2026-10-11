@@ -125,3 +125,34 @@ def test_zoom_child_chat_names_the_scope_its_ids_need(tmp_path):
             line = json.loads(zoom(child_log, Tree(child_root), None, 0, 1, scope=result["scope"]))
         assert line["text"] == "child task"
         assert line["scope"] == "Researcher"
+
+
+def test_zoom_by_name_does_not_seal_a_child_tree_tail(tmp_path):
+    child_root = tmp_path / "agents" / "child-session"
+    with Log(child_root) as child_log:
+        child_tree = Tree(child_root)
+        child_view = View(child_tree)
+        index = child_log.append("user", "child task")
+        Compactor(child_tree, lambda prompt: "summary").seed(index, "child task", "user")
+        child_view.add_root(index)
+        child_tree.save()
+        child_view.save()
+    (tmp_path / "agents" / "index.json").write_text(
+        json.dumps({"Researcher": "child-session"}), encoding="utf-8")
+    tree_path = next((child_root / "tree").glob("*.jsonl"))
+
+    # A complete node whose newline never landed: a sealing reader would make the
+    # file whole - a write to a chat this reader does not own.
+    torn = {"l": 0, "i": 1, "text": "user: second",
+            "size": len("user: second".encode("utf-8"))}
+    with tree_path.open("ab") as stream:
+        stream.write(json.dumps(torn).encode("utf-8"))
+    before = tree_path.read_bytes()
+
+    with Log(tmp_path) as master_log:
+        master_tree = Tree(tmp_path)
+        master_view = View(master_tree)
+        result = json.loads(zoom(master_log, master_tree, master_view, "Researcher"))
+        assert "child task" in result["chat"]
+
+    assert tree_path.read_bytes() == before

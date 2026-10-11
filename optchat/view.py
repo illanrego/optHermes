@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -27,15 +28,26 @@ def due(l: int, i: int, T: int) -> float:
 
 
 class View:
-    def __init__(self, tree: Tree, min_bytes: int = 64_000, max_bytes: int = 128_000):
+    def __init__(self, tree: Tree, min_bytes: int = 64_000, max_bytes: int = 128_000,
+                 *, records: int | None = None):
         if min_bytes < 0 or max_bytes <= 0 or min_bytes > max_bytes:
             raise ValueError("View budgets must satisfy 0 <= min_bytes <= max_bytes")
+        if records is not None and (type(records) is not int or records < 0):
+            raise ValueError("records must be a nonnegative integer")
         self.tree = tree
         self.min_bytes = min_bytes
         self.max_bytes = max_bytes
+        # The chat's record count when its owner knows it: missing view state in a
+        # chat that has records is an explicit outcome even when no tree node was
+        # ever saved. ``None`` when the caller cannot know (a foreign read).
+        self._records = records
         self._pairs: list[tuple[int, int]] = []
         self._batch_pending = False
         self._compaction_views: dict[tuple[int, int], _CompactionView] = {}
+        # True when this view was rebuilt from the tree because view.json was
+        # missing on a chat that had records; the marker is persisted so a later
+        # load can see that the recovery happened.
+        self._recovered = False
         self.load()
 
     def add_root(self, i: int) -> None:
@@ -164,12 +176,17 @@ class View:
         return False
 
     def save(self) -> None:
+        if self.tree._read_only:
+            # A view read through a foreign tree's read handle must not write
+            # that chat's view.json without its lock.
+            raise ValueError("View is read-only")
         path = Path(self.tree.root) / "view.json"
         path.parent.mkdir(parents=True, exist_ok=True)
         temporary = path.with_name("view.json.tmp")
         with temporary.open("w", encoding="utf-8") as stream:
             json.dump({"version": 2, "pairs": self._pairs,
                        "batch_pending": self._batch_pending,
+                       "recovered": self._recovered,
                        "compaction_views": [
                            {"min_bytes": minimum, "max_bytes": maximum,
                             "pairs": state.pairs, "batch_pending": state.batch_pending,
@@ -182,9 +199,27 @@ class View:
 
     def load(self) -> None:
         path = Path(self.tree.root) / "view.json"
+        self._recovered = False
         if not path.exists():
-            # The tree is the only source of known nodes on first creation.
             nodes = self.tree.nodes()
+            if not nodes and not self._records:
+                # A chat with no records: nothing was saved, nothing is lost, and
+                # the empty view is the correct view. Built silently.
+                self._pairs = []
+                self.save()
+                return
+            # The design forbids rebuilding a view: a rebuilt view renders
+            # differently and every cache entry for this chat dies. Missing state
+            # in a chat that has records is an explicit outcome, not a normal load:
+            # say what was lost, rebuild the closest available view from the tree's
+            # saved nodes (never from the log), and record the recovery in
+            # view.json so a later load can see that it happened.
+            warnings.warn(
+                f"OptChat view state is missing for {self.tree.root}: view.json is "
+                "gone, so the view state is lost and this chat's cache entries are "
+                "gone. Rebuilding the closest available view from the tree's saved "
+                "nodes; the rebuild does not restore the lost state.",
+                RuntimeWarning, stacklevel=2)
             end = max(((i + 1) << l for l, i in nodes), default=0)
             pairs = []
             cursor = 0
@@ -194,6 +229,7 @@ class View:
                 pairs.append(pair)
                 cursor += 1 << pair[0]
             self._pairs = pairs
+            self._recovered = True
             self.save()
             return
         raw = json.loads(path.read_text(encoding="utf-8"))
@@ -206,6 +242,10 @@ class View:
             raise ValueError("Invalid view.json version")
         self._pairs = self._read_pairs(raw["pairs"])
         self._batch_pending = self._read_pending(raw["batch_pending"])
+        recovered = raw.get("recovered", False)
+        if type(recovered) is not bool:
+            raise ValueError("Invalid view recovery marker")
+        self._recovered = recovered
         for item in raw["compaction_views"]:
             minimum, maximum = item["min_bytes"], item["max_bytes"]
             if (type(minimum) is not int or type(maximum) is not int

@@ -5,6 +5,7 @@ from __future__ import annotations
 import bisect
 import json
 import os
+import warnings
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -22,22 +23,28 @@ class Line:
 
 
 class Tree:
-    def __init__(self, root: Path, node_bytes: int = 512):
+    def __init__(self, root: Path, node_bytes: int = 512, *, read_only: bool = False):
         if node_bytes <= 0:
             raise ValueError("node_bytes must be positive")
         self.root = Path(root)
         self.node_bytes = node_bytes
+        # The lock-free read handle for another chat's tree: it never writes, so
+        # its loader does not seal a torn tail, and ``put`` / ``save`` refuse.
+        self._read_only = bool(read_only)
         self._nodes: dict[tuple[int, int], Line] = {}
         self._ready: list[tuple[int, int]] = []
         self._ready_set: set[tuple[int, int]] = set()
         self._pending: deque[Line] = deque()
+        # Coordinates whose saved line was refused at load: an invalid line has
+        # no text to keep, but the coordinate was seen and is never reused.
+        self._refused: set[tuple[int, int]] = set()
         self.load()
 
-    def _insert(self, line: Line, *, pending: bool) -> None:
+    def _insert(self, line: Line, *, pending: bool, lenient: bool = False) -> None:
         key = (line.l, line.i)
         if key in self._nodes:
             raise ValueError(f"Node already built: {key}")
-        if line.l > 0 and not all(child in self._nodes for child in self.children(*key)):
+        if not lenient and line.l > 0 and not all(child in self._nodes for child in self.children(*key)):
             raise ValueError(f"Node children are missing: {key}")
         self._nodes[key] = line
         if pending:
@@ -52,11 +59,23 @@ class Tree:
                 self._ready_set.add(parent)
 
     def put(self, l: int, i: int, text: str) -> None:
+        if self._read_only:
+            raise ValueError("Tree is read-only")
         if not isinstance(l, int) or not isinstance(i, int) or l < 0 or i < 0:
             raise ValueError("Node coordinates must be nonnegative integers")
         if not isinstance(text, str):
             raise TypeError("Node text must be a string")
+        if (l, i) in self._refused:
+            raise ValueError(f"Node {(l, i)} was refused at load and is never rewritten")
         self._insert(Line(l, i, text, len(text.encode("utf-8"))), pending=True)
+
+    def refused(self, l: int, i: int) -> bool:
+        """Whether this coordinate's saved line was refused at load.
+
+        A refused line is not a node and its coordinate is never written again:
+        the id was seen, so it can never be reused.
+        """
+        return (l, i) in self._refused
 
     def get(self, l: int, i: int) -> Line | None:
         return self._nodes.get((l, i))
@@ -96,6 +115,8 @@ class Tree:
         return self.get(l, i) is None and self.free_text(l, i) is None
 
     def save(self) -> None:
+        if self._read_only:
+            raise ValueError("Tree is read-only")
         if not self._pending:
             return
         date = datetime.now(timezone.utc).date().isoformat()
@@ -123,25 +144,22 @@ class Tree:
         self._nodes.clear()
         self._ready.clear()
         self._ready_set.clear()
+        self._refused.clear()
         restored: dict[tuple[int, int], Line] = {}
+        sources: dict[tuple[int, int], tuple[Path, int]] = {}
         for path in sorted((self.root / "tree").glob("????-??-??.jsonl")):
             # Same tail rule as the log: a node missing only its newline is kept
             # (read_jsonl seals it), a sealed fragment is skipped, and mid-file
-            # corruption raises.
-            for _offset, data in read_jsonl(path):
+            # corruption raises. A read-only handle never seals the file.
+            for offset, data in read_jsonl(path, seal=not self._read_only):
                 try:
                     line = Line(**data)
-                    valid = (
-                        isinstance(line.l, int)
-                        and isinstance(line.i, int)
-                        and line.l >= 0
-                        and line.i >= 0
-                        and isinstance(line.text, str)
-                        and line.size == len(line.text.encode("utf-8"))
-                    )
-                except (TypeError, KeyError):
+                except (TypeError, KeyError) as exc:
+                    self._refuse(path, offset, data, f"invalid node schema ({exc})")
                     continue
-                if not valid:
+                reason = self._node_reason(line)
+                if reason is not None:
+                    self._refuse(path, offset, data, reason)
                     continue
                 key = (line.l, line.i)
                 previous = restored.get(key)
@@ -150,8 +168,52 @@ class Tree:
                     # the same node means one of them is not the built line.
                     raise ValueError(f"Tree node {key} was written twice with different text")
                 restored[key] = line
-        for line in sorted(restored.values(), key=lambda item: (item.l, item.i)):
+                sources[key] = (path, offset)
+        for key in sorted(restored):
+            line = restored[key]
             try:
                 self._insert(line, pending=False)
-            except ValueError:
-                continue
+            except ValueError as exc:
+                # A node whose line was written but whose children are gone. It was
+                # built once: keep it rather than treating it as never written, and
+                # say so. Its coordinate is never rewritten (``put`` raises).
+                path, offset = sources[key]
+                warnings.warn(
+                    f"OptChat tree node at {path}:{offset} was already written but its "
+                    f"children are missing ({exc}); keeping it and refusing any rewrite",
+                    RuntimeWarning, stacklevel=2)
+                self._insert(line, pending=False, lenient=True)
+
+    def _refuse(self, path: Path, offset: int, data: object, reason: str) -> None:
+        """Warn about a refused line and keep its coordinate known.
+
+        Loud, never a silent skip: a node that parses but does not validate is
+        refused. When the line names a coordinate, that coordinate is recorded in
+        ``self._refused`` so it can never be written (reused) again.
+        """
+        warnings.warn(
+            f"OptChat tree line at {path}:{offset} is refused: {reason}",
+            RuntimeWarning, stacklevel=2)
+        key = self._coordinate(data)
+        if key is not None:
+            self._refused.add(key)
+
+    @staticmethod
+    def _coordinate(data: object) -> tuple[int, int] | None:
+        if not isinstance(data, dict):
+            return None
+        l, i = data.get("l"), data.get("i")
+        if not isinstance(l, int) or not isinstance(i, int) or l < 0 or i < 0:
+            return None
+        return (l, i)
+
+    @staticmethod
+    def _node_reason(line: Line) -> str | None:
+        """Why this parsed node does not validate, or ``None`` when it does."""
+        if not isinstance(line.l, int) or not isinstance(line.i, int) or line.l < 0 or line.i < 0:
+            return "node coordinates must be nonnegative integers"
+        if not isinstance(line.text, str):
+            return "node text must be a string"
+        if line.size != len(line.text.encode("utf-8")):
+            return "node size does not match its text"
+        return None

@@ -1,4 +1,7 @@
 import json
+import warnings
+
+import pytest
 
 from optchat.tree import Tree
 from optchat.view import View, due
@@ -118,14 +121,37 @@ def test_settled_tracks_placeholder_lines(tmp_path):
     assert view.settled()
 
 
-def test_missing_view_is_created_once_from_tree(tmp_path):
+def test_missing_view_on_a_chat_with_nodes_warns_and_records_the_recovery(tmp_path):
     tree = Tree(tmp_path)
     tree.put(0, 0, "a")
     tree.put(0, 1, "b")
     tree.put(1, 0, "a\nb")
-    view = View(tree)
+    tree.save()
+    # view.json is gone (never written, or lost); the tree kept its nodes.
+    with pytest.warns(RuntimeWarning, match="view state is missing") as caught:
+        view = View(tree)
+    assert "cache entries are gone" in str(caught[0].message)
     assert [(line.l, line.i) for line in view.lines()] == [(1, 0)]
-    assert (tmp_path / "view.json").exists()
+    data = json.loads((tmp_path / "view.json").read_text(encoding="utf-8"))
+    assert data["recovered"] is True
+
+    # A later load sees the recorded recovery and does not warn again.
+    with warnings.catch_warnings(record=True) as later:
+        warnings.simplefilter("always")
+        loaded = View(Tree(tmp_path))
+    assert not [item for item in later if "view state" in str(item.message)]
+    assert loaded._recovered is True
+    assert [(line.l, line.i) for line in loaded.lines()] == [(1, 0)]
+
+
+def test_missing_view_on_an_empty_chat_is_silent(tmp_path):
+    tree = Tree(tmp_path)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        view = View(tree)
+    assert not [item for item in caught if "view" in str(item.message)]
+    assert view.render() == "<chat>\n</chat>"
+    assert json.loads((tmp_path / "view.json").read_text(encoding="utf-8"))["recovered"] is False
 
 
 def test_context_view_merges_further_without_changing_live_pairs(tmp_path):

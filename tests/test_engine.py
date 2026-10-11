@@ -1069,3 +1069,178 @@ def test_restart_resumes_after_on_message_ingestion_without_gaps(tmp_path):
     restarted.on_turn_complete(messages + [tail])     # a re-send adds nothing
     assert restarted.log.count() == 3
     restarted.log.close()
+
+
+def test_recovery_extends_the_view_when_the_tree_is_ahead_of_it(tmp_path):
+    engine = OptChatEngine(tmp_path, summarize=FakeSummarizer())
+    engine.on_session_start("session")
+    engine.on_turn_complete([{"role": "user", "content": "first"}])
+    # The tree save succeeded; the view save did not: record 1's node is in the
+    # tree, and the view still ends at id 1.
+    index = engine.log.append("note", "second")
+    engine.compactor.seed(index, "second", "note")
+    engine.tree.save()
+    engine.log.close()
+
+    recovered = OptChatEngine(tmp_path, summarize=FakeSummarizer())
+    recovered.on_session_start("session")
+
+    assert recovered.view._end() == 2
+    assert "note: second" in recovered.view.render()
+    # A later append extends the view on the id it expects instead of failing.
+    index = recovered.log.append("note", "third")
+    recovered.view.add_root(index)
+    assert recovered.view._end() == 3
+    recovered.log.close()
+
+
+def test_missing_view_state_on_a_chat_with_records_warns_and_records_recovery(tmp_path):
+    engine = OptChatEngine(tmp_path, summarize=FakeSummarizer())
+    engine.on_session_start("session")
+    engine.on_turn_complete([{"role": "user", "content": "first"}])
+    engine.log.close()
+    (tmp_path / "view.json").unlink()
+
+    restarted = OptChatEngine(tmp_path, summarize=FakeSummarizer())
+    with pytest.warns(RuntimeWarning, match="view state is missing") as caught:
+        restarted.on_session_start("session")
+
+    assert "cache entries are gone" in str(caught[0].message)
+    assert restarted.view.render() == "<chat>\n0+1|user: first\n</chat>"
+    data = json.loads((tmp_path / "view.json").read_text(encoding="utf-8"))
+    assert data["recovered"] is True
+    restarted.log.close()
+
+
+def test_missing_view_state_on_an_empty_chat_is_silent(tmp_path):
+    engine = OptChatEngine(tmp_path, summarize=FakeSummarizer())
+    engine.on_session_start("session")
+    engine.log.close()
+    (tmp_path / "view.json").unlink()
+
+    restarted = OptChatEngine(tmp_path, summarize=FakeSummarizer())
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        restarted.on_session_start("session")
+
+    assert not [item for item in caught if "view" in str(item.message)]
+    assert restarted.view.render() == "<chat>\n</chat>"
+    restarted.log.close()
+
+
+def test_missing_view_state_on_a_chat_with_records_but_no_saved_nodes_warns(tmp_path):
+    # Records exist, but no tree node was ever saved and view.json is missing:
+    # still an explicit outcome, never a silent empty view.
+    with Log(tmp_path) as log:
+        log.append("user", "first")
+
+    restarted = OptChatEngine(tmp_path, summarize=FakeSummarizer())
+    with pytest.warns(RuntimeWarning, match="view state is missing"):
+        restarted.on_session_start("session")
+
+    data = json.loads((tmp_path / "view.json").read_text(encoding="utf-8"))
+    assert data["recovered"] is True
+    assert restarted.view._end() == 1   # recovery covered the record
+    assert restarted.view.render() == "<chat>\n0+1|user: first\n</chat>"
+    restarted.log.close()
+
+
+def test_scoped_and_named_navigation_do_not_seal_a_child_tree_tail(tmp_path):
+    master = OptChatEngine(tmp_path, summarize=FakeSummarizer())
+    master.on_session_start("master", platform="cli")
+    child = master.clone_for_agent()
+    child.on_session_start("child-session", platform="subagent")
+    child.on_turn_complete([{"role": "user", "content": "child step"}])
+    (tmp_path / "agents" / "index.json").write_text(
+        json.dumps({"child-session": "child-session"}), encoding="utf-8")
+    tree_path = next((tmp_path / "agents" / "child-session" / "tree").glob("*.jsonl"))
+    torn = {"l": 0, "i": 1, "text": "user: extra",
+            "size": len("user: extra".encode("utf-8"))}
+    with tree_path.open("ab") as stream:
+        stream.write(json.dumps(torn).encode("utf-8"))
+    before = tree_path.read_bytes()
+
+    # Scoped integer navigation opens the child's chat read-only.
+    scoped = json.loads(child.handle_tool_call(
+        "optchat_zoom", {"id": 0, "n": 1, "scope": "child-session"}))
+    assert scoped["text"] == "child step"
+    # String-name zoom opens the same child's chat.
+    named = json.loads(child.handle_tool_call("optchat_zoom", {"id": "child-session"}))
+    assert "child step" in named["chat"]
+
+    assert tree_path.read_bytes() == before
+    child.log.close()
+    master.log.close()
+
+
+def test_a_child_opening_its_master_does_not_seal_the_master_tree(tmp_path):
+    master = OptChatEngine(tmp_path, summarize=FakeSummarizer())
+    master.on_session_start("master", platform="cli")
+    master.on_turn_complete([{"role": "user", "content": "master context"}])
+    master.log.close()
+    tree_path = next((tmp_path / "tree").glob("*.jsonl"))
+    torn = {"l": 0, "i": 1, "text": "user: extra",
+            "size": len("user: extra".encode("utf-8"))}
+    with tree_path.open("ab") as stream:
+        stream.write(json.dumps(torn).encode("utf-8"))
+    before = tree_path.read_bytes()
+
+    # A child whose own engine never held the master's objects reads the master's
+    # view (and its tree) at session start and when it navigates.
+    child = OptChatEngine(tmp_path, summarize=FakeSummarizer())
+    child.on_session_start("child-session", platform="subagent")
+    whole = json.loads(child.handle_tool_call("optchat_zoom", {"id": 0, "n": 1}))
+    assert whole["text"] == "master context"
+
+    assert tree_path.read_bytes() == before
+    child.log.close()
+
+
+def test_recovery_covers_a_refused_tail_id_and_a_later_append_lands(tmp_path):
+    engine = OptChatEngine(tmp_path, summarize=FakeSummarizer())
+    engine.on_session_start("session")
+    engine.on_turn_complete([{"role": "user", "content": "first"}])
+    date = engine.log.get(0).date
+    engine.log.close()
+    # A corrupt line claims the next id; the log refuses it and keeps the id.
+    path = tmp_path / "main" / (date[:10] + ".jsonl")
+    bad = json.dumps({"id": 1, "kind": "thought", "text": "refused",
+                      "size": 7, "date": date}) + "\n"
+    with path.open("ab") as stream:
+        stream.write(bad.encode("utf-8"))
+
+    restarted = OptChatEngine(tmp_path, summarize=FakeSummarizer())
+    with pytest.warns(RuntimeWarning, match="is refused"):
+        restarted.on_session_start("session")
+
+    assert restarted.log.count() == 2     # the refused id keeps its position
+    assert restarted.log.get(1) is None
+    assert restarted.view._end() == 2     # the view covers the refused position
+    # The next row lands on the id after the refused one, and the view grows.
+    restarted.on_turn_complete([{"role": "user", "content": "first"},
+                                {"role": "user", "content": "second"}])
+    assert restarted.log.get(2).text == "second"
+    assert restarted.view._end() == 3
+    restarted.log.close()
+
+
+def test_a_refused_level0_node_does_not_block_session_start_or_later_appends(tmp_path):
+    with Log(tmp_path) as log:
+        log.append("user", "one")
+        log.append("user", "two")
+    path = tmp_path / "tree" / "2026-10-11.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"l": 0, "i": 0, "text": "bad", "size": 999}) + "\n",
+                    encoding="utf-8")
+
+    engine = OptChatEngine(tmp_path, summarize=FakeSummarizer())
+    with pytest.warns(RuntimeWarning, match="is refused"):
+        engine.on_session_start("session")
+
+    assert engine.tree.refused(0, 0)
+    assert engine.tree.get(0, 0) is None     # the refused node is never rebuilt
+    assert engine.view._end() == 2           # the view still covers both records
+    index = engine.log.append("note", "later")
+    engine.view.add_root(index)              # a later append still lands
+    assert index == 2
+    engine.log.close()

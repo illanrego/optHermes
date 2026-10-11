@@ -5,6 +5,7 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import warnings
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -47,7 +48,7 @@ class Log:
                 self._lock_fd = None
                 raise LogLockedError(f"Chat log is locked: {self.root}") from exc
 
-        self._index: list[tuple[Path, int]] = []
+        self._index: list[tuple[Path, int] | None] = []
         try:
             self._load_index()
         except BaseException:
@@ -57,6 +58,7 @@ class Log:
     def _load_index(self) -> None:
         main = self.root / "main"
         found: dict[int, tuple[Path, int]] = {}
+        refused: dict[int, tuple[Path, int]] = {}
         for path in sorted(main.glob("????-??-??.jsonl")):
             # read_jsonl seals a torn tail: a complete record missing only its
             # newline is indexed (and the file made whole), while an unparseable
@@ -66,18 +68,12 @@ class Log:
             for offset, data in read_jsonl(path, seal=not self._read_only):
                 try:
                     record = Record(**data)
-                    valid = (
-                        isinstance(record.id, int)
-                        and record.id >= 0
-                        and record.kind in KINDS
-                        and isinstance(record.text, str)
-                        and isinstance(record.date, str)
-                        and record.date[:10] == path.stem
-                        and record.size == len(record.text.encode("utf-8"))
-                    )
-                except (TypeError, KeyError):
+                except (TypeError, KeyError) as exc:
+                    self._refuse(path, offset, data, f"invalid record schema ({exc})", refused)
                     continue
-                if not valid:
+                reason = self._record_reason(record, path)
+                if reason is not None:
+                    self._refuse(path, offset, data, reason, refused)
                     continue
                 if record.id in found:
                     # First-wins would make the later record unreachable and let
@@ -87,9 +83,45 @@ class Log:
                         f"{found[record.id][0].name} and {path.name}"
                     )
                 found[record.id] = (path, offset)
-        if set(found) != set(range(len(found))):
+        seen = set(found) | set(refused)
+        if seen != set(range(len(seen))):
             raise ValueError("Chat log has a gap in its record IDs")
-        self._index = [found[i] for i in range(len(found))]
+        # A refused id keeps its position: the index knows it was seen, ``get``
+        # returns ``None`` for it, and ``append`` never reuses it.
+        self._index = [found.get(i) for i in range(len(seen))]
+
+    @staticmethod
+    def _refuse(path: Path, offset: int, data: object, reason: str,
+                refused: dict[int, tuple[Path, int]]) -> None:
+        """Warn about a refused line and keep its id known so it is never reused.
+
+        Loud, never a silent skip: a line that parses but does not validate is
+        refused. When the line names an id, that id keeps its position in the
+        index and the next append can never reuse it.
+        """
+        warnings.warn(
+            f"OptChat chat log line at {path}:{offset} is refused: {reason}",
+            RuntimeWarning, stacklevel=2)
+        refused_id = data.get("id") if isinstance(data, dict) else None
+        if isinstance(refused_id, int) and refused_id >= 0:
+            refused.setdefault(refused_id, (path, offset))
+
+    @staticmethod
+    def _record_reason(record: Record, path: Path) -> str | None:
+        """Why this parsed record does not validate, or ``None`` when it does."""
+        if not isinstance(record.id, int) or record.id < 0:
+            return "record id must be a nonnegative integer"
+        if record.kind not in KINDS:
+            return f"unknown record kind {record.kind!r}"
+        if not isinstance(record.text, str):
+            return "record text must be a string"
+        if not isinstance(record.date, str):
+            return "record date must be a string"
+        if record.date[:10] != path.stem:
+            return "record date does not match the file's day"
+        if record.size != len(record.text.encode("utf-8")):
+            return "record size does not match its text"
+        return None
 
     def append(self, kind: str, text: str) -> int:
         if self._read_only:
@@ -125,12 +157,16 @@ class Log:
     def get(self, i: int) -> Record | None:
         if i < 0 or i >= len(self._index):
             return None
-        path, offset = self._index[i]
+        entry = self._index[i]
+        if entry is None:
+            return None  # a refused line's position, never a record
+        path, offset = entry
         with path.open("rb") as stream:
             stream.seek(offset)
             return Record(**json.loads(stream.readline()))
 
-    def range(self, lo: int, hi: int) -> list[Record]:
+    def range(self, lo: int, hi: int) -> list[Record | None]:
+        """The records for ids ``lo..hi`` inclusive; ``None`` at a refused id."""
         if hi < lo:
             return []
         return [self.get(i) for i in range(max(lo, 0), min(hi + 1, self.count()))]
