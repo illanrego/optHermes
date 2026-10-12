@@ -20,9 +20,10 @@ Where it stands:
   and on_message. They are NOT merged into any running host, and there are NO PRs - the user's rule
   is that nothing goes upstream until he has tested it on his terms.
 - Orders 1, 2 and 4 of the plan are **DONE and merged to main** (Order 1: 07d5fa8 → f548c0d; Order 2:
-  6dcfa92; Order 4: 0fa9f67 plus the host gate 81af99c011 in the seam worktree). Main is at HEAD with
-  295 tests green, CONTRACT revisions 12-17 in order. The second challenge's D2/D4 verdicts are
-  applied: recovery hardened (56e857c, Order 2b) and identity-first (dbd4633, Order 2c).
+ 6dcfa92; Order 4: 0fa9f67 plus the host gate 81af99c011 in the seam worktree). Main is at HEAD with
+ 329 tests green, CONTRACT revisions 12-18 in order. The second challenge's D2/D4 verdicts are
+ applied (56e857c Order 2b, dbd4633 Order 2c), and Order 3 landed as b27e94c - UID turn boundaries
+ with conformance checks and a durable, frozen selected view per logical turn and scope.
 - The fourth seam - the logical-turn boundary (`turn_boundary`) - landed on the seam worktree branch
   `feat/context-engine-seams` at `202e30e78f`.
 - **P3b has been redone** (commit 8fa8cb9, CONTRACT revision 15): the rebuild is cut, and a missing view
@@ -47,9 +48,8 @@ FIRST, check that state:
 
 What is next, in the plan's order:
 
-- Order 3 (P2a, P3a) is next: the brief is ready and launches immediately - the engine consumes the
-  boundary seam with conformance checks, and the selected view is frozen per logical turn and scope.
-- Order 5 (P4a, P4b): the compaction's request identity, then the cache measurements.
+- Order 5 (P4a, P4b): the compaction's request shape, then the prefix comparison and the cache
+  measurements (the live-wire measurement rides the live run).
 - Then a LIVE RUN. The engine has not been exercised inside a real host since WP4, and that run is
   also the gate for merging the host seams (seam worktree: `feat/context-engine-seams` at 202e30e78f).
 

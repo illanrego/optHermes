@@ -33,7 +33,7 @@ The plan's orders (`docs/PLAN-next.md`, revision 2) run on top of these:
 | Order 4 | P6b, #16, acceptance test | truthful, usable retrieval | DONE (0fa9f67 engine, host gate 81af99c011 in the seam worktree) |
 | Order 0 | D1-D5 | the decisions: target host, `message_uid` identity, the frozen view, the recovery protocol, missing-view policy | written (dc243aa), challenged twice (revisions 2-3: 34cccbe, 675ae08); the D2/D4 verdicts are applied |
 | Order 2 | P1b, P1d | the durability protocol | DONE (6dcfa92, merged 4a7d925; hardened in 56e857c, Order 2b, and dbd4633, Order 2c; CONTRACT revisions 16-17) |
-| Order 3 | P2a, P3a | the turn boundary by UID, and the frozen served view | NEXT (the boundary seam landed at `202e30e78f` in the fork; the P2a/P3a brief is ready to launch) |
+| Order 3 | P2a, P3a | the turn boundary by UID, and the frozen served view | DONE (b27e94c; CONTRACT revision 18) |
 | Order 5 | P4a, P4b | the compaction's request shape, then the measurements | held (needs D3) |
 
 Order and why: **WP1** first (the turn-boundary bug is the most urgent active-turn defect and

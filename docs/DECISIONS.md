@@ -165,6 +165,6 @@ on the host boundary seam and the recovery prerequisites above. Execution of the
 host-integrated test matrix remains unverified until then, and the documents say so.
 
 **Landed:** the recovery hardening (Order 2b, `56e857c`), identity-first recovery (Order 2c, `dbd4633`),
-and the host boundary seam (`202e30e78f` in the seam worktree). The remaining limits are recorded in
-CONTRACT revisions 16-17; the engine consumes the seam in Order 3.
+and the host boundary seam (`202e30e78f` in the seam worktree). Order 3 landed as `b27e94c`
+(CONTRACT revision 18); the remaining limits are recorded in revisions 16-18.
 
