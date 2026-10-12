@@ -52,13 +52,13 @@ def make_host_summarizer(*, timeout: float = 300.0) -> Summarizer:
             model = route.get("model") or ""
             if provider != "auto" and not model:
                 raise RuntimeError("auxiliary.optchat pins a provider but no model")
-        user_content = (request.context + "\n\n" + request.task
-                        if request.context else request.task)
         messages = ([{"role": "system", "content": request.system}]
                     if request.system else [])
-        messages.append({"role": "user", "content": user_content})
+        if request.context:
+            messages.append({"role": "assistant", "content": request.context})
+        messages.append({"role": "user", "content": request.task})
         logger.debug("OptChat compaction prompt: %d UTF-8 bytes",
-                     len(user_content.encode("utf-8")))
+                     len(request.context.encode("utf-8")) + len(request.task.encode("utf-8")))
         response = call_llm(
             task="optchat",
             messages=messages,

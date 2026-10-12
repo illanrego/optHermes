@@ -221,7 +221,8 @@ Missing any of these means the model cannot navigate the view.
 
 ## Compaction calls are shaped like turns
 
-A compaction is a call shaped like a turn, so it reads the turns' cache entry.
+A compaction uses the turn's message roles to permit a shared prefix. Matching
+roles does not prove cache reuse; revision 19 records the envelope and limits.
 
 ```python
 @dataclass(frozen=True)
@@ -237,8 +238,10 @@ Summarizer = Callable[[CompactionRequest], str]
 - `View.context_view(min_bytes=COMPACT_VIEW_MIN_BYTES, max_bytes=COMPACT_VIEW_MAX_BYTES) -> str`
   returns the chat's view merged further, rendered as `<chat>...</chat>`.
 - The engine supplies the last assembled turn system text and the host's tool schemas.
-- `make_host_summarizer` sends them through the aux route: the system as a system
-  message, the context and task as the user message, and `tools` passed through.
+- `make_host_summarizer` sends them through the aux route as
+  `[system: request.system][assistant: request.context][user: request.task]`,
+  with `tools` passed through (amended by revision 19). Empty system or context
+  omits only its own message; the task remains a separate user message.
 
 ## Admission (settle) - as built, and its honest limit
 
@@ -1147,3 +1150,71 @@ rows remain host requirements. A notification containing old unconsumed history
 before admission, UID-less pre-selection rows, or unavailable legacy checkpoint
 evidence can make capture unavailable. Total loss of all independent metadata is
 not detectable as a particular former turn without external host evidence.
+
+---
+
+# Revision 19 - compaction roles and engine prefix comparison (2026-10-12)
+
+Plan Order 5 part 1 (P4a and the engine-side half of P4b). This supersedes
+revision 2's concatenated context/task envelope and its cache-reuse claim.
+`make_host_summarizer` passes this exact message shape to `call_llm`:
+
+```python
+[
+    {"role": "system", "content": request.system},
+    {"role": "assistant", "content": request.context},
+    {"role": "user", "content": request.task},
+]
+```
+
+The contents are unmodified strings: the last assembled turn's system text,
+the rendered `<chat>...</chat>` compaction context, and the separate task.
+Empty context omits the assistant message. Empty system continues to omit the
+system message; with context present, assistant and user still remain separate.
+With neither, only the user task is sent. Tools keep flowing as
+`tools=request.tools or None`; route selection, timeout, retries and ordinary
+reply handling are unchanged.
+
+Matching roles is necessary but not sufficient for a matching view prefix. The
+compaction view advances and merges independently of the live view and the
+frozen selected turn view, so its leading lines can differ. A shared earlier
+system/tools prefix may still be reusable. Each target's retained context stays
+fixed under revision 6, including a fresh request after the live view advances.
+Neither guaranteed reuse nor total absence of reuse follows from these facts.
+
+## Reproducible engine-side measurement
+
+Run `python3 -m pytest -q -s -p no:cacheprovider tests/test_compaction_prefix.py`.
+The test serializes actual `select_context` output and captured auxiliary
+`call_llm` arguments, restricted to prompt-bearing `tools` and `messages`.
+Serialization is compact JSON with `ensure_ascii=False`, UTF-8 encoding, keys
+`tools` then `messages`, preserving message/schema key order. These offsets are
+zero-based byte offsets in that defined serialization, **not provider wire bytes**.
+
+The deterministic fixture uses the real 512-byte node, 16/32 KB compaction and
+64/128 KB live-view budgets, multibyte source text, and stubbed 512-byte model
+summaries. Older parents are built through the engine's end-of-turn drain.
+Two final roots leave a merge job pending; its request is built through
+`Compactor._request` and sent through `make_host_summarizer` to the stub. The
+probe does not commit that reply. Six more roots advance the live view and a
+new target naturally crosses the compaction ceiling. No context is rebuilt
+from the live view and no pairs are replaced to force overlap.
+
+| Comparison | Left/right JSON bytes | Shared leading bytes | First divergence |
+|---|---:|---:|---|
+| (a) Turn -> compaction, same state | 32947 / 35570 | 32456 | User content byte 0: turn text vs compaction task |
+| (b) Turn -> compaction after context merge | 32947 / 21400 | 2432 | Assistant content byte 9: `0+1` vs `0+4` |
+| (b) Merged compaction -> same-turn selection | 21400 / 35552 | 2432 | Assistant content byte 9: `0+4` vs `0+1` |
+| (b) Turn -> same-turn selection, expanded tail | 32947 / 35552 | 32945 | Messages array closes vs another tail row |
+| (c) New turn with advanced live view -> fresh original target | 35947 / 35570 | 32420 | Assistant content byte 29937: `60+1` vs `</chat>` |
+| (c) Original compaction -> fresh original target | 35570 / 35570 | 35570 | None; entire serialized prompt matches |
+| (c) Merged compaction -> fresh original target | 21400 / 35570 | 2432 | Assistant content byte 9: `0+4` vs `0+1` |
+
+These numbers describe this fixture, not expected hit rates. Tools appear first
+in this diagnostic JSON by an explicit comparison convention; this does not
+assert their provider ordering. Host sanitization, cache decoration, routing,
+provider serialization and cache policy can change reuse. Live-wire measurement
+of `cache_read_tokens` across turn->turn, turn->compaction and
+compaction->compaction remains unverified and belongs to the later live run.
+The old-envelope finding in `docs/HANDOFF.md` describes the pre-P4a state;
+this amendment records its correction within this task's allowed edit paths.

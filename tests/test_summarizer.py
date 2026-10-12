@@ -58,8 +58,33 @@ def test_host_receives_turn_system_context_task_tools_and_configured_route(monke
         context="<chat>\n0+1|prior\n</chat>", tools=tools)) == "first second"
     assert calls == [{"task": "optchat", "messages": [
         {"role": "system", "content": "turn system"},
-        {"role": "user", "content": "<chat>\n0+1|prior\n</chat>\n\n" + prompt}],
+        {"role": "assistant", "content": "<chat>\n0+1|prior\n</chat>"},
+        {"role": "user", "content": prompt}],
         "tools": tools, "timeout": 17.0}]
+    assert calls[0]["messages"][1]["content"].startswith("<chat>")
+    assert calls[0]["messages"][1]["content"].endswith("</chat>")
+
+
+@pytest.mark.parametrize("system", ["", "turn system"])
+def test_no_context_omits_assistant_message(monkeypatch, system):
+    calls = []
+    _fake_host(monkeypatch, lambda **kwargs: calls.append(kwargs) or "line")
+    from optchat.summarizer import make_host_summarizer
+
+    make_host_summarizer()(request("task", system=system))
+    expected = [{"role": "system", "content": system}] if system else []
+    assert calls[0]["messages"] == expected + [{"role": "user", "content": "task"}]
+
+
+def test_no_system_omits_system_but_keeps_context_separate(monkeypatch):
+    calls = []
+    _fake_host(monkeypatch, lambda **kwargs: calls.append(kwargs) or "line")
+    from optchat.summarizer import make_host_summarizer
+
+    context = "<chat>\n0+1|prior\n</chat>"
+    make_host_summarizer()(request("task", context=context))
+    assert calls[0]["messages"] == [
+        {"role": "assistant", "content": context}, {"role": "user", "content": "task"}]
 
 
 def test_empty_context_and_system_send_only_task(monkeypatch):
