@@ -6,11 +6,13 @@ import fcntl
 import json
 import os
 import warnings
+from contextlib import contextmanager
+from threading import RLock
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .persistence import read_jsonl
+from .persistence import read_jsonl, sync_directory
 
 
 KINDS = frozenset({"user", "unii", "tool", "echo", "work", "note"})
@@ -32,6 +34,9 @@ class LogLockedError(RuntimeError):
 class Log:
     def __init__(self, root: Path, *, read_only: bool = False):
         self.root = Path(root)
+        self._append_lock = RLock()
+        self._transaction = False
+        self._append_failed = False
         self._read_only = bool(read_only)
         if self._read_only:
             # A lock-free read handle for another chat: the chat's owner may hold
@@ -123,7 +128,44 @@ class Log:
             return "record size does not match its text"
         return None
 
+    @contextmanager
+    def transaction(self, *, ingestion: bool = False):
+        """Exclude other append paths, including reentrant note imports."""
+        with self._append_lock:
+            if self._transaction:
+                raise RuntimeError("Log append transaction cannot be nested")
+            if self._append_failed:
+                raise RuntimeError("Log append durability unavailable; reopen the log")
+            self._transaction = "ingestion" if ingestion else "external"
+            try:
+                yield
+            finally:
+                self._transaction = False
+
     def append(self, kind: str, text: str) -> int:
+        with self._append_lock:
+            if self._append_failed:
+                raise RuntimeError("Log append durability unavailable; reopen the log")
+            if self._transaction != "ingestion":
+                self.check_ingestion_idle()
+            return self._append(kind, text)
+
+    def check_ingestion_idle(self) -> None:
+        """An unresolved durable intent owns the tail even outside a hook call."""
+        if (self.root / "ingest-unavailable.json").exists():
+            raise RuntimeError("Append unavailable: unresolved ingestion recovery")
+        checkpoint = self.root / "ingest.json"
+        try:
+            state = json.loads(checkpoint.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return
+        except (OSError, ValueError) as exc:
+            raise RuntimeError("Append unavailable: unreadable ingestion checkpoint") from exc
+        if (not isinstance(state, dict) or state.get("inflight") is not None
+                or state.get("lost") is not None or state.get("failure") is not None):
+            raise RuntimeError("Append unavailable: unresolved ingestion transaction")
+
+    def _append(self, kind: str, text: str) -> int:
         if self._read_only:
             raise ValueError("Log is read-only")
         if kind not in KINDS:
@@ -136,22 +178,31 @@ class Log:
         date = datetime.now(timezone.utc).isoformat()
         record = Record(len(self._index), kind, text, len(text.encode("utf-8")), date)
         path = self.root / "main" / f"{date[:10]}.jsonl"
-        path.parent.mkdir(parents=True, exist_ok=True)
+        if not path.parent.exists():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            sync_directory(self.root)
+        new_file = not path.exists()
         payload = (json.dumps(record.__dict__, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
-        with path.open("a+b") as stream:
-            stream.seek(0, os.SEEK_END)
-            offset = stream.tell()
-            if offset:
-                stream.seek(-1, os.SEEK_END)
-                if stream.read(1) != b"\n":
-                    stream.seek(0, os.SEEK_END)
-                    stream.write(b"\n")
-                    offset += 1
-            stream.seek(0, os.SEEK_END)
-            stream.write(payload)
-            stream.flush()
-            os.fsync(stream.fileno())
-        self._index.append((path, offset))
+        try:
+            with path.open("a+b") as stream:
+                stream.seek(0, os.SEEK_END)
+                offset = stream.tell()
+                if offset:
+                    stream.seek(-1, os.SEEK_END)
+                    if stream.read(1) != b"\n":
+                        stream.seek(0, os.SEEK_END)
+                        stream.write(b"\n")
+                        offset += 1
+                stream.seek(0, os.SEEK_END)
+                stream.write(payload)
+                stream.flush()
+                os.fsync(stream.fileno())
+            if new_file:
+                sync_directory(path.parent)
+            self._index.append((path, offset))
+        except BaseException:
+            self._append_failed = True
+            raise
         return record.id
 
     def get(self, i: int) -> Record | None:

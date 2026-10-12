@@ -1798,35 +1798,30 @@ def test_recovery_refuses_a_row_that_no_longer_recomputes_identically(tmp_path):
     restarted.log.close()
 
 
-def test_lost_boundary_is_recorded_once_and_a_later_turn_retries(tmp_path):
-    """When no fingerprint matches, the failure is recorded once and a later turn
-    retries from the newest row still identifiable, instead of freezing forever
-    on an unchanged checkpoint. The interval before the anchor is not guessed."""
+def test_lost_boundary_preserves_interval_across_turns_and_restart(tmp_path):
+    """Replace the old test that blessed progress from the newest content anchor."""
     engine = OptChatEngine(tmp_path, summarize=FakeSummarizer())
     engine.on_session_start("session")
     engine.on_turn_complete([{"role": "user", "content": "one"}])
+    rewritten = [{"role": "user", "content": "X"}, {"role": "user", "content": "Y"}]
+    with pytest.warns(RuntimeWarning, match="cannot find its ingestion boundary"):
+        engine.on_turn_complete(rewritten)
+    checkpoint = json.loads((tmp_path / "ingest.json").read_text())
+    assert checkpoint["lost"]["committed_count"] == 1
+    assert checkpoint["lost"]["rows"] == 1
+    assert "unavailable" in checkpoint["lost"]["reason"]
+    later = rewritten + [{"role": "assistant", "content": "new work"}]
+    engine.on_turn_complete(later)
+    assert json.loads((tmp_path / "ingest.json").read_text()) == checkpoint
+    assert engine.log.count() == 1
     engine.log.close()
 
     restarted = OptChatEngine(tmp_path, summarize=FakeSummarizer())
     restarted.on_session_start("session")
-    rewritten = [{"role": "user", "content": "rewritten history"}]
-    with pytest.warns(RuntimeWarning, match="cannot find its ingestion boundary"):
-        restarted.on_turn_complete(rewritten)
-    assert restarted.log.count() == 1  # nothing guessed, nothing duplicated
-    checkpoint = json.loads((tmp_path / "ingest.json").read_text(encoding="utf-8"))
-    assert checkpoint["lost"] == {"fingerprint": _row_fingerprint(rewritten[-1]), "rows": 1}
-
-    later = rewritten + [{"role": "assistant", "content": "new work"}]
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
+    with pytest.warns(RuntimeWarning, match="unavailable"):
         restarted.on_turn_complete(later)
-    assert not [item for item in caught if "ingestion boundary" in str(item.message)]
-    assert [record.text for record in restarted.log.range(0, restarted.log.count() - 1)] == [
-        "one", "rewritten history", "new work"]
-    checkpoint = json.loads((tmp_path / "ingest.json").read_text(encoding="utf-8"))
-    assert checkpoint["lost"] is None and checkpoint["inflight"] is None
-    restarted.on_turn_complete(later)  # a re-send adds nothing
-    assert restarted.log.count() == 3
+    assert restarted.log.count() == 1
+    assert json.loads((tmp_path / "ingest.json").read_text()) == checkpoint
     restarted.log.close()
 
 
@@ -1873,3 +1868,236 @@ def test_dispatched_payload_with_inline_results_produces_work_records(tmp_path):
             master.log.range(0, master.log.count() - 1)].count("work") == 2
     child.log.close()
     master.log.close()
+
+
+def _interrupt_before_first_append(engine, messages, monkeypatch):
+    original = engine.log.append
+
+    def crash(kind, text):
+        raise RuntimeError("before first append")
+
+    monkeypatch.setattr(engine.log, "append", crash)
+    with pytest.raises(RuntimeError, match="before first append"):
+        engine.on_turn_complete(messages)
+    monkeypatch.setattr(engine.log, "append", original)
+    return json.loads((engine._chat_root / "ingest.json").read_text())
+
+
+@pytest.mark.parametrize("change", ["budget", "classification", "none"])
+def test_zero_delta_validates_complete_sequence(tmp_path, monkeypatch, change):
+    engine = OptChatEngine(tmp_path, node_bytes=16, summarize=FakeSummarizer())
+    engine.on_session_start("session")
+    row = {"role": "user", "content": "one two three four five six seven eight"}
+    original = _interrupt_before_first_append(engine, [row], monkeypatch)
+    assert engine.log.count() == 0
+    if change == "budget":
+        engine.node_bytes = 8
+    elif change == "classification":
+        monkeypatch.setattr(engine, "_records", lambda *args: [("unii", "changed")])
+    if change == "none":
+        engine.on_turn_complete([row])
+        checkpoint = json.loads((tmp_path / "ingest.json").read_text())
+        assert checkpoint["inflight"] is None
+        assert engine.log.count() == len(original["inflight"]["records"])
+    else:
+        with pytest.warns(RuntimeWarning, match="no longer recomputes"):
+            engine.on_turn_complete([row])
+        checkpoint = json.loads((tmp_path / "ingest.json").read_text())
+        assert checkpoint["inflight"] == original["inflight"]
+        assert engine.log.count() == 0
+    engine.log.close()
+
+
+@pytest.mark.parametrize("wrong_start", [0, 2])
+def test_wrong_count_before_fails_against_committed_frontier(tmp_path, monkeypatch, wrong_start):
+    engine = OptChatEngine(tmp_path, summarize=FakeSummarizer())
+    engine.on_session_start("session")
+    first = {"role": "user", "content": "X"}
+    second = {"role": "user", "content": "X"}
+    engine.on_turn_complete([first])
+    state = _interrupt_before_first_append(engine, [first, second], monkeypatch)
+    assert state["committed_count"] == 1
+    if wrong_start == 2:
+        # Simulate the first record surviving before an erroneously advanced start.
+        with (tmp_path / "main" / (engine.log.get(0).date[:10] + ".jsonl")).open("ab") as out:
+            record = dict(engine.log.get(0).__dict__, id=1)
+            out.write((json.dumps(record) + "\n").encode())
+        engine.log._load_index()
+    state["inflight"]["count_before"] = wrong_start
+    (tmp_path / "ingest.json").write_text(json.dumps(state))
+    with pytest.warns(RuntimeWarning, match="count_before.*committed"):
+        engine.on_turn_complete([first, second])
+    assert engine.log.count() == (2 if wrong_start == 2 else 1)
+    assert json.loads((tmp_path / "ingest.json").read_text())["inflight"] == state["inflight"]
+    engine.log.close()
+
+
+@pytest.mark.parametrize("damage", ["missing", "json", "outer", "session", "permission"])
+def test_established_checkpoint_unavailable_never_reingests(tmp_path, monkeypatch, damage):
+    engine = OptChatEngine(tmp_path, summarize=FakeSummarizer())
+    engine.on_session_start("session")
+    messages = [{"role": "user", "content": "old"}]
+    engine.on_turn_complete(messages)
+    path = tmp_path / "ingest.json"
+    if damage == "missing":
+        path.unlink()
+    elif damage == "json":
+        path.write_text("{broken")
+    elif damage == "outer":
+        path.write_text(json.dumps({"session": "session", "rows": True, "fingerprints": []}))
+    elif damage == "session":
+        engine.on_session_start("new-session")
+    original = path.read_bytes() if path.exists() else None
+    if damage == "permission":
+        read_text = Path.read_text
+
+        def denied(self, *args, **kwargs):
+            if self == path:
+                raise PermissionError("injected unreadable checkpoint")
+            return read_text(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", denied)
+    with pytest.warns(RuntimeWarning, match="recovery unavailable"):
+        engine.on_turn_complete(messages + [{"role": "user", "content": "new"}])
+    assert engine.log.count() == 1
+    assert (path.read_bytes() if path.exists() else None) == original
+    unavailable = (tmp_path / "ingest-unavailable.json").read_bytes()
+    engine.on_turn_complete(messages)
+    assert (tmp_path / "ingest-unavailable.json").read_bytes() == unavailable
+    engine.log.close()
+    restarted = OptChatEngine(tmp_path, summarize=FakeSummarizer())
+    restarted.on_session_start("session")
+    with pytest.warns(RuntimeWarning, match="unavailable"):
+        restarted.on_turn_complete(messages)
+    assert restarted.log.count() == 1
+    restarted.log.close()
+
+
+def test_fresh_checkpoint_starts_without_recovery_warning(tmp_path):
+    engine = OptChatEngine(tmp_path, summarize=FakeSummarizer())
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        engine.on_turn_complete([{"role": "user", "content": "fresh"}])
+    assert not _recovery_warnings(caught)
+    assert engine.log.get(0).text == "fresh"
+    assert not (tmp_path / "ingest-unavailable.json").exists()
+    engine.log.close()
+
+
+def test_note_import_cannot_reenter_ingestion(tmp_path, monkeypatch):
+    from optchat.notes import import_notes
+
+    engine = OptChatEngine(tmp_path, summarize=FakeSummarizer())
+    engine.on_session_start("session")
+    append = engine.log.append
+    rejected = []
+
+    def attempt_note(kind, text):
+        with pytest.raises(RuntimeError, match="cannot be nested"):
+            import_notes(engine.log, engine.compactor, engine.view, ["foreign note"])
+        rejected.append(True)
+        return append(kind, text)
+
+    monkeypatch.setattr(engine.log, "append", attempt_note)
+    engine.on_turn_complete([_three_call_row()])
+    assert len(rejected) == 3
+    assert [engine.log.get(i).kind for i in range(3)] == ["tool"] * 3
+    engine.log.close()
+
+
+def test_note_import_refuses_surviving_ingestion_intent(tmp_path, monkeypatch):
+    from optchat.notes import import_notes
+
+    engine = OptChatEngine(tmp_path, summarize=FakeSummarizer())
+    engine.on_session_start("session")
+    state = _interrupt_before_first_append(engine, [_three_call_row()], monkeypatch)
+    with pytest.raises(RuntimeError, match="unresolved ingestion transaction"):
+        import_notes(engine.log, engine.compactor, engine.view, ["foreign note"])
+    assert engine.log.count() == 0
+    assert json.loads((tmp_path / "ingest.json").read_text()) == state
+    engine.log.close()
+
+
+def test_completed_range_is_validated_before_marker_clear(tmp_path, monkeypatch):
+    engine = OptChatEngine(tmp_path, summarize=FakeSummarizer())
+    engine.on_session_start("session")
+    append = engine.log.append
+
+    def substitute(kind, text):
+        return append(kind, "incorrect payload")
+
+    monkeypatch.setattr(engine.log, "append", substitute)
+    with pytest.warns(RuntimeWarning, match="does not match"):
+        engine.on_turn_complete([{"role": "user", "content": "expected payload"}])
+    state = json.loads((tmp_path / "ingest.json").read_text())
+    assert state["rows"] == 0 and state["inflight"] is not None
+    assert state["committed_count"] == 0
+    assert "does not match" in state["failure"]["reason"]
+    assert engine.log.get(0).text == "incorrect payload"
+    engine.log.close()
+
+
+def test_lost_boundary_keeps_interrupted_marker_even_when_source_returns(tmp_path, monkeypatch):
+    engine = OptChatEngine(tmp_path, summarize=FakeSummarizer())
+    engine.on_session_start("session")
+    row = _three_call_row()
+    original = _interrupt_before_first_append(engine, [row], monkeypatch)
+    with pytest.warns(RuntimeWarning, match="unavailable"):
+        engine.on_turn_complete([{"role": "user", "content": "X"},
+                                 {"role": "user", "content": "Y"}])
+    state = json.loads((tmp_path / "ingest.json").read_text())
+    assert state["inflight"] == original["inflight"]
+    assert state["lost"] is not None
+    engine.on_turn_complete([row, {"role": "user", "content": "later"}])
+    assert json.loads((tmp_path / "ingest.json").read_text()) == state
+    assert engine.log.count() == 0
+    engine.log.close()
+
+
+def test_note_thread_waits_for_completed_ingestion_transaction(tmp_path, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+    from optchat.notes import import_notes
+
+    engine = OptChatEngine(tmp_path, summarize=FakeSummarizer())
+    engine.on_session_start("session")
+    started = Event()
+    seed = engine.compactor.seed
+    futures = []
+
+    def notes():
+        started.set()
+        return import_notes(engine.log, engine.compactor, engine.view, ["after row"])
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        def after_append(*args):
+            if not futures:
+                futures.append(executor.submit(notes))
+                assert started.wait(2)
+                assert not futures[0].done()
+            return seed(*args)
+
+        monkeypatch.setattr(engine.compactor, "seed", after_append)
+        engine.on_turn_complete([_three_call_row()])
+        assert futures[0].result(timeout=2) == 1
+    assert [engine.log.get(i).kind for i in range(4)] == ["tool", "tool", "tool", "note"]
+    assert json.loads((tmp_path / "ingest.json").read_text())["inflight"] is None
+    engine.log.close()
+
+
+def test_zero_delta_validation_after_incomplete_json_tail(tmp_path, monkeypatch):
+    engine = OptChatEngine(tmp_path, node_bytes=16, summarize=FakeSummarizer())
+    engine.on_session_start("session")
+    row = {"role": "user", "content": "one two three four five six seven eight"}
+    original = _interrupt_before_first_append(engine, [row], monkeypatch)
+    main = tmp_path / "main"
+    main.mkdir()
+    (main / "2026-10-12.jsonl").write_bytes(b'{"id":0,"kind":"user"')
+    engine.log.close()
+    restarted = OptChatEngine(tmp_path, node_bytes=8, summarize=FakeSummarizer())
+    restarted.on_session_start("session")
+    with pytest.warns(RuntimeWarning, match="no longer recomputes"):
+        restarted.on_turn_complete([row])
+    assert restarted.log.count() == 0
+    assert json.loads((tmp_path / "ingest.json").read_text())["inflight"] == original["inflight"]
+    restarted.log.close()

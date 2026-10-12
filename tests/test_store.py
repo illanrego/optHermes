@@ -184,3 +184,43 @@ def test_parseable_invalid_records_are_loud_and_never_reused(tmp_path):
         assert [record.text for record in reopened.range(0, 1)] == ["first", "second"]
         assert reopened.get(2) is None
         assert reopened.get(4).text == "after"
+
+
+def test_new_day_file_syncs_directory_before_append_returns(tmp_path, monkeypatch):
+    import optchat.store as store
+
+    synced = []
+    real_sync = store.sync_directory
+
+    def sync(path):
+        synced.append(path)
+        real_sync(path)
+
+    monkeypatch.setattr(store, "sync_directory", sync)
+    with Log(tmp_path) as log:
+        log.append("user", "first")
+        assert synced == [tmp_path, tmp_path / "main"]
+        log.append("user", "same day")
+        assert synced == [tmp_path, tmp_path / "main"]
+
+
+def test_day_directory_sync_failure_requires_reopen(tmp_path, monkeypatch):
+    import optchat.store as store
+
+    real_sync = store.sync_directory
+
+    def fail_main(path):
+        if path == tmp_path / "main":
+            raise OSError("injected directory sync failure")
+        real_sync(path)
+
+    with Log(tmp_path) as log:
+        monkeypatch.setattr(store, "sync_directory", fail_main)
+        with pytest.raises(OSError, match="directory sync"):
+            log.append("user", "surviving bytes")
+        with pytest.raises(RuntimeError, match="durability unavailable"):
+            log.append("user", "must not reuse the id")
+    monkeypatch.setattr(store, "sync_directory", real_sync)
+    with Log(tmp_path) as log:
+        assert log.get(0).text == "surviving bytes"
+        assert log.append("user", "next") == 1

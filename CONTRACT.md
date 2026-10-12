@@ -740,63 +740,50 @@ taken name.
 
 # Revision 14 - the durability protocol (2026-10-11)
 
-Plan Order 2 (P1b, P1d). This supersedes revision 8's sentence that "the checkpoint advances only
-after all records of a row are durable, so a crash mid-row re-ingests that row instead of skipping
-its remaining records": a crash mid-row used to **replay** that row's already-written records, and
-the comment claiming otherwise was false. The log stays append-only; nothing is ever repaired by
-deleting or rewriting a logged record.
+Plan Order 2 (P1b, P1d). The recovery findings in this section are corrected and
+superseded by revision 16 (2026-10-12). The log stays append-only; logged records
+are never repaired by deletion or rewriting.
 
-## The in-flight marker (P1b, per D4)
+## The in-flight marker (P1b, per D4; corrected by revision 16)
 
-`<chat_root>/ingest.json` gains a durable in-flight marker:
+`<chat_root>/ingest.json` records the committed record frontier separately from
+an interrupted row's expected payload sequence:
 
 ```json
-{"session": "...", "rows": 0, "fingerprints": [],
- "inflight": {"fingerprint": "<row identity>", "count_before": 0,
+{"session": "...", "rows": 0, "fingerprints": [], "committed_count": 0,
+ "inflight": {"fingerprint": "<payload fingerprint>", "count_before": 0,
               "records": [{"kind": "...", "digest": "..."}]},
- "lost": {"fingerprint": "...", "rows": 0},
- "failure": {"reason": "..."}}
+ "lost": null, "failure": null}
 ```
 
-The marker is written **before** a row's first record and cleared in the same durable write as that
-row's checkpoint advance. It carries the occurrence identity (the row fingerprint), the log's record
-count before the row, and the record sequence the row is writing - one kind and digest per record, in
-order (**ordinal provenance**).
+The marker is published before the first record. Its `count_before` must equal
+`committed_count`; a mismatch is an explicit recovery failure. The surviving
+range must match the expected kinds and digests at every position, with no refused
+position or impossible delta. The whole recomputed sequence must match even when
+no complete record survived. A completed range is validated before clearing its
+marker and advancing the committed frontier.
 
-Recovery reads the log's count - the durable truth - and skips exactly `count_now - count_before`
-records for that row before continuing, after validating them: position by position, the log's
-records in the marker's range must match the recorded sequence (kind and digest), and the delta must
-not exceed that sequence. A **refused position, a content mismatch, or an impossible delta is an
-explicit recovery failure - never completion**: ingestion stops at that row, one warning (once per
-engine) and one error line name it, and the failure is recorded in `ingest.json` for inspection.
-Skipping an unverified range could declare inaccessible or foreign records complete; replaying it
-could duplicate records. The validated remainder is then appended, so a row that wrote two of its
-three records resumes at the third and a row that wrote all three is skipped whole: a crash never
-duplicates a record and never skips one. A resumed row's media archive hangs off its first record and
-is re-run idempotently.
+Expected kinds and digests are payload checks, **not ordinal provenance or
+occurrence identity**. Equal payloads do not establish ownership. The earlier
+claim that a content fingerprint identifies an occurrence, or that the marker by
+itself prevents every duplicate or skipped occurrence, is withdrawn. See revision
+16 for the remaining identity-dependent recovery limitation.
 
-Range ownership is by **ordinal provenance in the marker**, not by serializing every append path: the
-marker is the only artifact that holds the interrupted attempt's record sequence, cross-process
-appends are already excluded by the log's exclusive lock, and an in-process interleave (another
-append path inside the range) is caught by the per-position validation and fails explicitly instead
-of being attributed to the row.
+Append transactions serialize the ingestion hooks, including checkpoint loading,
+recovery, append and checkpoint publication, with note imports through the same
+`Log` instance. Reentrant imports fail explicitly; another thread waits. A
+surviving intent also prevents external appends between hook calls or after a
+restart. The process-lifetime file lock continues to exclude other owning logs.
 
-Replay must generate the same record sequence as the interrupted attempt (splitting depends on
-`node_bytes`; delegate classification depends on the surrounding context and the persisted index).
-The marker satisfies that requirement by recording the attempt's sequence and validating the
-recomputation against it before appending anything; a divergence (a changed budget, a relabeled
-child) is an explicit recovery failure rather than a silently different remainder.
+## The lost ingestion boundary (P1b; corrected by revision 16)
 
-## The lost ingestion boundary (P1b)
-
-When no recorded fingerprint matches the transcript (a compression rewrote it), the failure is
-**recorded once** - one warning, and a durable `lost` anchor naming the newest row the engine can
-still identify (the in-flight marker's row when it survives, else the transcript's newest row, the
-one row provably not yet ingested). Ingesting nothing on that turn is deliberate: guessing a boundary
-could duplicate history. A later turn retries from the anchor instead of freezing on an unchanged
-checkpoint; the anchor is refreshed to the current newest row if it, too, is rewritten away. The
-honest bound: the interval before the anchor is not ingested (it was never identifiable), and the
-recorded failure names it.
+A missing source boundary records a durable unresolved interval in `lost`,
+preserving the old checkpoint and in-flight marker. It does not choose a newest
+content match as an anchor. Later turns and restarts ingest nothing across this
+interval, even if an old payload reappears. Recovery is unavailable without a
+proven contiguous committed occurrence boundary and ordered host evidence. This
+change replaces the earlier advance-and-clear behavior; it does not claim the
+engine can manufacture the missing host evidence.
 
 ## Media failures are preserved, not swallowed (P1d)
 
@@ -863,3 +850,57 @@ A missing `view.json` is handled as follows:
 
 `view.json` no longer carries a `recovered` key, and the loader ignores the key in a legacy
 file (only the retired rebuild path ever wrote it). Otherwise the version-2 schema is unchanged.
+
+
+---
+
+# Revision 16 - engine recovery hardening (2026-10-12)
+
+This dated amendment supersedes revision 14's recovery findings, following D4 in
+`docs/DECISIONS.md` revision 3 and sections 4 and 5 of the second challenge.
+
+- **Independent start binding:** `committed_count` is published at the clean
+  boundary before the row intent, and after a validated completed row. It is not
+  inferred from the surviving marker's `count_before` during recovery. A missing
+  or invalid committed frontier is unavailable evidence. Failure recording keeps
+  that missing value missing rather than silently inventing a new frontier.
+- **Validation:** a surviving marker's entire recomputed sequence is checked at
+  delta zero as well as positive deltas, before replacement or append. Every
+  completed range is checked before the marker is cleared, including uninterrupted
+  ingestion. Payload validation does not prove durable host occurrence identity.
+- **Unresolved interval:** `lost` preserves the original row frontier, committed
+  record count, observed projection length, and unavailable reason. The old
+  in-flight marker remains intact. Subsequent turns do not refresh an anchor or
+  clear this state. There is no automatic recovery without ordered host evidence.
+- **Checkpoint evidence:** only no checkpoint plus no records means a fresh
+  stream. Unreadable JSON, malformed outer fields, missing checkpoints on an
+  established log, and session mismatches stop ingestion. A durable
+  `ingest-unavailable.json` sidecar records the unavailable reason, requested
+  session and observed record count; the original checkpoint bytes remain intact.
+  The sidecar is sticky across turns and restarts, including restoration of an
+  apparently valid checkpoint. Resolving it requires external evidence and an
+  operator action; no repair/reset API is introduced here.
+- **Session transitions:** a new session on an existing stream is unavailable
+  recovery, not permission to replay from zero or discard the old frontier. The
+  transition is recorded on the next ingestion hook. Starting a new stream in a
+  distinct root remains possible. No automatic stream migration is implemented.
+- **Append exclusion:** a per-`Log` reentrant mutex covers each complete ingestion
+  hook, including recovery. `import_notes` uses the same transaction scope for its
+  whole import and derived-state publication. Nested transactions fail before
+  append; competing threads wait. All `Log.append` calls acquire the mutex, and
+  external append paths refuse unresolved durable ingestion state. This excludes
+  supported note interleaves; it does not retroactively prove ownership of legacy
+  records or supply host occurrence provenance.
+- **Day-file publication:** a newly created day file is file-synced, then `main/`
+  is directory-synced before append succeeds. Creating `main/` also syncs its
+  parent. An append I/O failure poisons that open log for further writes; reopening
+  reindexes the surviving bytes before any id can be reused. This is tested by
+  fault injection, not a physical power-loss experiment.
+
+**Remaining requirement / test conflict:** the legacy source-boundary search still
+uses content fingerprints. It cannot distinguish distinct equal-content
+occurrences, and must not be represented as satisfying D4's host identity or
+ordered-frontier requirements. Removing that fallback requires changing existing
+UID-less restart and changed-tail tests beyond the single lost-boundary test
+allowed by this task. That scope decision is pending; this amendment records the
+engine-side hardening without claiming full D4 compliance or P2a readiness.
