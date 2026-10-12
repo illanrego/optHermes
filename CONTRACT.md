@@ -735,3 +735,83 @@ taken name.
 - Registration happens when a result is resolved - at selection for the running turn, or at
   ingestion - before the record text is built, so the record and the index can never disagree about
   the label.
+
+---
+
+# Revision 14 - the durability protocol (2026-10-11)
+
+Plan Order 2 (P1b, P1d). This supersedes revision 8's sentence that "the checkpoint advances only
+after all records of a row are durable, so a crash mid-row re-ingests that row instead of skipping
+its remaining records": a crash mid-row used to **replay** that row's already-written records, and
+the comment claiming otherwise was false. The log stays append-only; nothing is ever repaired by
+deleting or rewriting a logged record.
+
+## The in-flight marker (P1b, per D4)
+
+`<chat_root>/ingest.json` gains a durable in-flight marker:
+
+```json
+{"session": "...", "rows": 0, "fingerprints": [],
+ "inflight": {"fingerprint": "<row identity>", "count_before": 0,
+              "records": [{"kind": "...", "digest": "..."}]},
+ "lost": {"fingerprint": "...", "rows": 0},
+ "failure": {"reason": "..."}}
+```
+
+The marker is written **before** a row's first record and cleared in the same durable write as that
+row's checkpoint advance. It carries the occurrence identity (the row fingerprint), the log's record
+count before the row, and the record sequence the row is writing - one kind and digest per record, in
+order (**ordinal provenance**).
+
+Recovery reads the log's count - the durable truth - and skips exactly `count_now - count_before`
+records for that row before continuing, after validating them: position by position, the log's
+records in the marker's range must match the recorded sequence (kind and digest), and the delta must
+not exceed that sequence. A **refused position, a content mismatch, or an impossible delta is an
+explicit recovery failure - never completion**: ingestion stops at that row, one warning (once per
+engine) and one error line name it, and the failure is recorded in `ingest.json` for inspection.
+Skipping an unverified range could declare inaccessible or foreign records complete; replaying it
+could duplicate records. The validated remainder is then appended, so a row that wrote two of its
+three records resumes at the third and a row that wrote all three is skipped whole: a crash never
+duplicates a record and never skips one. A resumed row's media archive hangs off its first record and
+is re-run idempotently.
+
+Range ownership is by **ordinal provenance in the marker**, not by serializing every append path: the
+marker is the only artifact that holds the interrupted attempt's record sequence, cross-process
+appends are already excluded by the log's exclusive lock, and an in-process interleave (another
+append path inside the range) is caught by the per-position validation and fails explicitly instead
+of being attributed to the row.
+
+Replay must generate the same record sequence as the interrupted attempt (splitting depends on
+`node_bytes`; delegate classification depends on the surrounding context and the persisted index).
+The marker satisfies that requirement by recording the attempt's sequence and validating the
+recomputation against it before appending anything; a divergence (a changed budget, a relabeled
+child) is an explicit recovery failure rather than a silently different remainder.
+
+## The lost ingestion boundary (P1b)
+
+When no recorded fingerprint matches the transcript (a compression rewrote it), the failure is
+**recorded once** - one warning, and a durable `lost` anchor naming the newest row the engine can
+still identify (the in-flight marker's row when it survives, else the transcript's newest row, the
+one row provably not yet ingested). Ingesting nothing on that turn is deliberate: guessing a boundary
+could duplicate history. A later turn retries from the anchor instead of freezing on an unchanged
+checkpoint; the anchor is refreshed to the current newest row if it, too, is rewritten away. The
+honest bound: the interval before the anchor is not ingested (it was never identifiable), and the
+recorded failure names it.
+
+## Media failures are preserved, not swallowed (P1d)
+
+A media decode/read/index failure records the failed part's **reference and failure** in
+`<root>/assets/pending.json` (`message_id`, `part_index`, `type`, `reference`, the part itself when
+JSON-safe, `error`, `attempts`). A retry pass (`optchat.media.retry_pending_media`, run at session
+start) re-reads or re-decodes a local path or embedded payload and archives it on success, removing
+the entry. A **remote URL keeps its reference only**: fetching remote bytes is a separate, open item,
+so the reference survives and the archived-media promise remains open. The row checkpoint still
+advances - the log record is the durable text, the pending reference is the durable media intent.
+
+## Durable publications and dispatched reports
+
+`View.save()` writes through the same durable replacement `atomic_json()` uses (fsync'd temporary,
+atomic rename, directory sync), so a view publication is as durable as a checkpoint publication; the
+media index is written the same way. A delegate result with `status="dispatched"` that carries a
+nonempty `inline_results` list is ingested as the `work` records it carries (one per completed
+entry); a dispatched payload with nothing completed inline still produces no records.

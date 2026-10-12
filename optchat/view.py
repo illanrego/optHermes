@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import json
-import os
 import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .persistence import atomic_json
 from .tree import Line, Tree
 
 
@@ -182,20 +182,18 @@ class View:
             raise ValueError("View is read-only")
         path = Path(self.tree.root) / "view.json"
         path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_name("view.json.tmp")
-        with temporary.open("w", encoding="utf-8") as stream:
-            json.dump({"version": 2, "pairs": self._pairs,
-                       "batch_pending": self._batch_pending,
-                       "recovered": self._recovered,
-                       "compaction_views": [
-                           {"min_bytes": minimum, "max_bytes": maximum,
-                            "pairs": state.pairs, "batch_pending": state.batch_pending,
-                            "contexts": state.contexts}
-                           for (minimum, maximum), state in self._compaction_views.items()
-                       ]}, stream, separators=(",", ":"))
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, path)
+        # The same durable replacement a checkpoint publication uses: fsync'd
+        # temporary, atomic rename, and the directory sync that makes the rename
+        # itself durable. A view publication is as durable as a checkpoint.
+        atomic_json(path, {"version": 2, "pairs": self._pairs,
+                           "batch_pending": self._batch_pending,
+                           "recovered": self._recovered,
+                           "compaction_views": [
+                               {"min_bytes": minimum, "max_bytes": maximum,
+                                "pairs": state.pairs, "batch_pending": state.batch_pending,
+                                "contexts": state.contexts}
+                               for (minimum, maximum), state in self._compaction_views.items()
+                           ]})
 
     def load(self) -> None:
         path = Path(self.tree.root) / "view.json"

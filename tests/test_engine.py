@@ -14,6 +14,7 @@ import pytest
 
 from optchat import OptChatEngine
 from optchat.compactor import Compactor
+from optchat.engine import _record_digest, _row_fingerprint
 from optchat.prompts import SYSTEM_PROMPT
 from optchat.store import Log
 from optchat.tree import Tree
@@ -1428,3 +1429,382 @@ def test_a_refused_level0_node_does_not_block_session_start_or_later_appends(tmp
     engine.view.add_root(index)              # a later append still lands
     assert index == 2
     engine.log.close()
+
+
+# --- Order 2 (P1b): the durable in-flight marker and its recovery arithmetic --
+
+
+def _three_call_row():
+    """One host row whose classification is exactly three records."""
+    return {"role": "assistant", "content": None, "tool_calls": [
+        {"id": "call-1", "function": {"name": "first", "arguments": "{}"}},
+        {"id": "call-2", "function": {"name": "second", "arguments": "{}"}},
+        {"id": "call-3", "function": {"name": "third", "arguments": "{}"}},
+    ]}
+
+
+def _marker_checkpoint(row, expected, *, kind="tool"):
+    """The durable checkpoint a crash mid-row leaves behind."""
+    return {"session": "session", "rows": 0, "fingerprints": [],
+            "inflight": {"fingerprint": _row_fingerprint(row), "count_before": 0,
+                         "records": [{"kind": kind, "digest": _record_digest(kind, text)}
+                                     for text in expected]},
+            "lost": None, "failure": None}
+
+
+def test_crash_between_two_of_three_records_resumes_at_the_third(tmp_path):
+    """A crash after the second of a row's three records: the marker is durable,
+    and a re-run appends exactly the third - no duplicate, no skip."""
+    row = _three_call_row()
+    expected = [text for _kind, text in OptChatEngine._records(row, 512)]
+    assert len(expected) == 3
+
+    engine = OptChatEngine(tmp_path, summarize=FakeSummarizer())
+    engine.on_session_start("session")
+    calls = {"count": 0}
+    real_append = engine.log.append
+
+    def crash_on_third(kind, text):
+        if calls["count"] == 2:
+            raise RuntimeError("crash between the second record and the checkpoint")
+        calls["count"] += 1
+        return real_append(kind, text)
+
+    engine.log.append = crash_on_third
+    with pytest.raises(RuntimeError):
+        engine.on_turn_complete([row])
+
+    # Two records are durable, and the marker written *before* the first append
+    # is durable too, holding the row's identity, count_before and full sequence.
+    assert engine.log.count() == 2
+    assert [engine.log.get(i).text for i in range(2)] == expected[:2]
+    checkpoint = json.loads((tmp_path / "ingest.json").read_text(encoding="utf-8"))
+    assert checkpoint["rows"] == 0 and checkpoint["inflight"]["count_before"] == 0
+    assert checkpoint["inflight"]["fingerprint"] == _row_fingerprint(row)
+    assert [item["digest"] for item in checkpoint["inflight"]["records"]] == [
+        _record_digest("tool", text) for text in expected]
+    engine.log.close()
+
+    restarted = OptChatEngine(tmp_path, summarize=FakeSummarizer())
+    restarted.on_session_start("session")
+    restarted.on_message([row], copy.deepcopy(row))  # the host re-sends the row
+    assert [restarted.log.get(i).text for i in range(3)] == expected
+    assert restarted.log.count() == 3
+    restarted.on_turn_complete([row])                # the reconciler adds nothing
+    assert restarted.log.count() == 3
+    checkpoint = json.loads((tmp_path / "ingest.json").read_text(encoding="utf-8"))
+    assert checkpoint["rows"] == 1 and checkpoint["inflight"] is None
+    restarted.log.close()
+
+
+def test_crash_mid_row_for_a_split_text_row_reassembles_exactly(tmp_path):
+    """The two-of-three case on a split text row: the marker's recorded sequence
+    makes the remainder exact - the reassembled message equals the original."""
+    text = ("alpha bravo charlie delta echo foxtrot golf hotel india juliet "
+            "kilo lima mike november oscar papa quebec romeo sierra tango")
+    row = {"role": "user", "content": text}
+    first = OptChatEngine(tmp_path, node_bytes=24, summarize=FakeSummarizer())
+    first.on_session_start("session")
+    calls = {"count": 0}
+    real_append = first.log.append
+
+    def crash_after_two(kind, value):
+        if calls["count"] == 2:
+            raise RuntimeError("crash after two records")
+        calls["count"] += 1
+        return real_append(kind, value)
+
+    first.log.append = crash_after_two
+    with pytest.raises(RuntimeError):
+        first.on_turn_complete([row])
+    assert first.log.count() == 2
+    first.log.close()
+
+    restarted = OptChatEngine(tmp_path, node_bytes=24, summarize=FakeSummarizer())
+    restarted.on_session_start("session")
+    restarted.on_turn_complete([row])
+    records = restarted.log.range(0, restarted.log.count() - 1)
+    assert all(record.kind == "user" for record in records)
+    assert len({record.id for record in records}) == len(records)
+    assert "".join(record.text for record in records) == text  # nothing lost
+    assert restarted.log.count() == len(records)
+    checkpoint = json.loads((tmp_path / "ingest.json").read_text(encoding="utf-8"))
+    assert checkpoint["rows"] == 1 and checkpoint["inflight"] is None
+    restarted.on_turn_complete([row])
+    assert restarted.log.count() == len(records)
+    restarted.log.close()
+
+
+def test_crash_after_all_three_records_skips_the_row_whole(tmp_path):
+    """A crash between the last record and the checkpoint advance: the row wrote
+    all three, so recovery skips it whole - the records are never duplicated."""
+    row = _three_call_row()
+    expected = [text for _kind, text in OptChatEngine._records(row, 512)]
+
+    engine = OptChatEngine(tmp_path, summarize=FakeSummarizer())
+    engine.on_session_start("session")
+    real_save = engine._save_checkpoint
+
+    def crash_before_advance(rows, recent, **kwargs):
+        if rows == 1 and kwargs.get("inflight") is None:
+            raise RuntimeError("crash between the last record and the advance")
+        return real_save(rows, recent, **kwargs)
+
+    engine._save_checkpoint = crash_before_advance
+    with pytest.raises(RuntimeError):
+        engine.on_turn_complete([row])
+
+    assert engine.log.count() == 3
+    assert [engine.log.get(i).text for i in range(3)] == expected
+    checkpoint = json.loads((tmp_path / "ingest.json").read_text(encoding="utf-8"))
+    assert checkpoint["rows"] == 0 and checkpoint["inflight"]["count_before"] == 0
+    engine.log.close()
+
+    restarted = OptChatEngine(tmp_path, summarize=FakeSummarizer())
+    restarted.on_session_start("session")
+    restarted.on_turn_complete([row])
+    assert restarted.log.count() == 3
+    checkpoint = json.loads((tmp_path / "ingest.json").read_text(encoding="utf-8"))
+    assert checkpoint["rows"] == 1 and checkpoint["inflight"] is None
+    restarted.on_turn_complete([row])  # a re-send adds nothing
+    assert restarted.log.count() == 3
+    restarted.log.close()
+
+
+def _recovery_warnings(caught):
+    return [item for item in caught if "recovery failed" in str(item.message)]
+
+
+def test_recovery_refuses_a_refused_position_in_the_inflight_range(tmp_path):
+    """A refused position in the marker's range is an explicit recovery failure:
+    its payload cannot be validated, so nothing is skipped and nothing completes."""
+    row = _three_call_row()
+    expected = [text for _kind, text in OptChatEngine._records(row, 512)]
+    with Log(tmp_path) as log:
+        log.append("tool", expected[0])
+        date = log.get(0).date
+        bad = json.dumps({"id": 1, "kind": "thought", "text": "refused",
+                          "size": 7, "date": date}) + "\n"
+        with (tmp_path / "main" / (date[:10] + ".jsonl")).open("ab") as stream:
+            stream.write(bad.encode("utf-8"))
+    (tmp_path / "ingest.json").write_text(json.dumps(_marker_checkpoint(row, expected)),
+                                          encoding="utf-8")
+
+    engine = OptChatEngine(tmp_path, summarize=FakeSummarizer())
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        engine.on_session_start("session")
+        engine.on_turn_complete([row])
+
+    recovery = _recovery_warnings(caught)
+    assert len(recovery) == 1 and recovery[0].category is RuntimeWarning
+    assert "is refused" in str(recovery[0].message)
+    # Explicit failure, never completion: no skip, no append, no rewrite.
+    assert engine.log.count() == 2
+    assert engine.log.get(0).text == expected[0]
+    assert engine.log.get(1) is None
+    checkpoint = json.loads((tmp_path / "ingest.json").read_text(encoding="utf-8"))
+    assert checkpoint["rows"] == 0
+    assert "is refused" in checkpoint["failure"]["reason"]
+    engine.log.close()
+
+
+def test_recovery_refuses_a_content_mismatch_in_the_inflight_range(tmp_path):
+    """A foreign record interleaved inside the range (A, note, then a crash) is a
+    content mismatch: skipping would silently lose the row's own remaining record,
+    so recovery fails explicitly instead."""
+    row = _three_call_row()
+    expected = [text for _kind, text in OptChatEngine._records(row, 512)]
+    with Log(tmp_path) as log:
+        log.append("tool", expected[0])
+        log.append("note", "a foreign append")  # interleaved inside the range
+    (tmp_path / "ingest.json").write_text(json.dumps(_marker_checkpoint(row, expected)),
+                                          encoding="utf-8")
+
+    engine = OptChatEngine(tmp_path, summarize=FakeSummarizer())
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        engine.on_session_start("session")
+        engine.on_turn_complete([row])
+
+    recovery = _recovery_warnings(caught)
+    assert len(recovery) == 1
+    assert "does not match the in-flight row's record sequence" in str(recovery[0].message)
+    assert engine.log.count() == 2  # the foreign record was never skipped or deleted
+    assert engine.log.get(1).kind == "note"
+    checkpoint = json.loads((tmp_path / "ingest.json").read_text(encoding="utf-8"))
+    assert "does not match" in checkpoint["failure"]["reason"]
+    engine.log.close()
+
+
+def test_recovery_refuses_an_impossible_delta(tmp_path):
+    """More records after the marker than the row's recorded sequence is an
+    impossible delta: an append path interleaved, so the range is not owned."""
+    row = _three_call_row()
+    expected = [text for _kind, text in OptChatEngine._records(row, 512)]
+    with Log(tmp_path) as log:
+        for text in expected:
+            log.append("tool", text)
+        log.append("note", "one append too many")
+    (tmp_path / "ingest.json").write_text(json.dumps(_marker_checkpoint(row, expected)),
+                                          encoding="utf-8")
+
+    engine = OptChatEngine(tmp_path, summarize=FakeSummarizer())
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        engine.on_session_start("session")
+        engine.on_turn_complete([row])
+
+    recovery = _recovery_warnings(caught)
+    assert len(recovery) == 1
+    assert "the row records only 3" in str(recovery[0].message)
+    assert engine.log.count() == 4  # untouched: never skipped, never rewritten
+    checkpoint = json.loads((tmp_path / "ingest.json").read_text(encoding="utf-8"))
+    assert "records only 3" in checkpoint["failure"]["reason"]
+    engine.log.close()
+
+
+def test_recovery_refuses_a_malformed_marker_and_keeps_refusing(tmp_path):
+    """A present-but-unreadable marker cannot validate anything: it is an explicit
+    failure that stays recorded, never dropped as if the row were complete."""
+    with Log(tmp_path) as log:
+        log.append("tool", "partial record")
+    (tmp_path / "ingest.json").write_text(json.dumps({
+        "session": "session", "rows": 0, "fingerprints": [],
+        "inflight": {"fingerprint": "not-a-real-row", "count_before": 0},
+        "lost": None, "failure": None}), encoding="utf-8")
+
+    engine = OptChatEngine(tmp_path, summarize=FakeSummarizer())
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        engine.on_session_start("session")
+        engine.on_turn_complete([{"role": "user", "content": "next"}])
+    recovery = _recovery_warnings(caught)
+    assert len(recovery) == 1
+    assert "marker is malformed" in str(recovery[0].message)
+    assert engine.log.count() == 1  # nothing appended, nothing skipped
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        engine.on_turn_complete([{"role": "user", "content": "next"}])
+    assert not _recovery_warnings(caught)  # warned once per engine
+    assert engine.log.count() == 1         # still refusing, never duplicating
+    checkpoint = json.loads((tmp_path / "ingest.json").read_text(encoding="utf-8"))
+    assert "marker is malformed" in checkpoint["failure"]["reason"]
+    assert checkpoint["inflight"] is not None  # kept, still unreadable
+    engine.log.close()
+
+
+def test_recovery_refuses_a_row_that_no_longer_recomputes_identically(tmp_path):
+    """Replay must generate the same record sequence as the interrupted attempt:
+    the marker recorded it, and a changed node budget makes the recomputation
+    diverge, which is an explicit failure rather than a different remainder."""
+    row = {"role": "user", "content": "one two three four five six seven eight nine ten"}
+    first = OptChatEngine(tmp_path, node_bytes=16, summarize=FakeSummarizer())
+    first.on_session_start("session")
+    calls = {"count": 0}
+    real_append = first.log.append
+
+    def crash_on_second(kind, text):
+        if calls["count"] == 1:
+            raise RuntimeError("crash after the first record")
+        calls["count"] += 1
+        return real_append(kind, text)
+
+    first.log.append = crash_on_second
+    with pytest.raises(RuntimeError):
+        first.on_turn_complete([row])
+    written = first.log.count()
+    assert written == 1
+    first.log.close()
+
+    restarted = OptChatEngine(tmp_path, node_bytes=8, summarize=FakeSummarizer())
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        restarted.on_session_start("session")
+        restarted.on_turn_complete([row])
+
+    recovery = _recovery_warnings(caught)
+    assert len(recovery) == 1
+    assert "no longer recomputes" in str(recovery[0].message)
+    assert restarted.log.count() == written  # the divergent remainder was not written
+    checkpoint = json.loads((tmp_path / "ingest.json").read_text(encoding="utf-8"))
+    assert "recomputes" in checkpoint["failure"]["reason"]
+    restarted.log.close()
+
+
+def test_lost_boundary_is_recorded_once_and_a_later_turn_retries(tmp_path):
+    """When no fingerprint matches, the failure is recorded once and a later turn
+    retries from the newest row still identifiable, instead of freezing forever
+    on an unchanged checkpoint. The interval before the anchor is not guessed."""
+    engine = OptChatEngine(tmp_path, summarize=FakeSummarizer())
+    engine.on_session_start("session")
+    engine.on_turn_complete([{"role": "user", "content": "one"}])
+    engine.log.close()
+
+    restarted = OptChatEngine(tmp_path, summarize=FakeSummarizer())
+    restarted.on_session_start("session")
+    rewritten = [{"role": "user", "content": "rewritten history"}]
+    with pytest.warns(RuntimeWarning, match="cannot find its ingestion boundary"):
+        restarted.on_turn_complete(rewritten)
+    assert restarted.log.count() == 1  # nothing guessed, nothing duplicated
+    checkpoint = json.loads((tmp_path / "ingest.json").read_text(encoding="utf-8"))
+    assert checkpoint["lost"] == {"fingerprint": _row_fingerprint(rewritten[-1]), "rows": 1}
+
+    later = rewritten + [{"role": "assistant", "content": "new work"}]
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        restarted.on_turn_complete(later)
+    assert not [item for item in caught if "ingestion boundary" in str(item.message)]
+    assert [record.text for record in restarted.log.range(0, restarted.log.count() - 1)] == [
+        "one", "rewritten history", "new work"]
+    checkpoint = json.loads((tmp_path / "ingest.json").read_text(encoding="utf-8"))
+    assert checkpoint["lost"] is None and checkpoint["inflight"] is None
+    restarted.on_turn_complete(later)  # a re-send adds nothing
+    assert restarted.log.count() == 3
+    restarted.log.close()
+
+
+def test_dispatched_payload_with_inline_results_produces_work_records(tmp_path):
+    """A delegate payload with status='dispatched' carrying completed
+    ``inline_results`` is ingested as the work records it carries; a dispatched
+    payload with nothing completed inline still logs nothing."""
+    master = OptChatEngine(tmp_path, summarize=FakeSummarizer())
+    master.on_session_start("master", platform="cli")
+    child = master.clone_for_agent()
+    child.on_session_start("child-session", platform="subagent")
+    child.on_turn_complete([{"role": "user", "content": "find the answer"}])
+
+    payload = {"status": "dispatched", "mode": "background", "count": 2,
+               "delegation_id": "deleg-1", "goals": ["a", "b"],
+               "inline_results": [
+                   {"task_index": 0, "name": "Researcher",
+                    "child_session_id": "child-session", "summary": "found it"},
+                   {"task_index": 1, "name": "Auditor", "summary": "checked"}]}
+    messages = [{"role": "assistant", "content": None, "tool_calls": [
+                    {"id": "delegate-1", "function": {"name": "delegate_task",
+                                                      "arguments": "{}"}}]},
+                {"role": "tool", "tool_call_id": "delegate-1",
+                 "content": json.dumps(payload)}]
+    master.on_turn_complete(messages)
+
+    records = master.log.range(0, master.log.count() - 1)
+    work = [record for record in records if record.kind == "work"]
+    assert len(work) == 2
+    assert work[0].text.startswith("[Researcher] ") and "found it" in work[0].text
+    assert work[1].text.startswith("[Auditor] ")
+    assert json.loads((tmp_path / "agents" / "index.json").read_text(encoding="utf-8")) == {
+        "Researcher": "child-session"}
+
+    empty = {"status": "dispatched", "mode": "background", "count": 1,
+             "delegation_id": "deleg-2", "goals": ["later"]}
+    later = [{"role": "assistant", "content": None, "tool_calls": [
+                  {"id": "delegate-2", "function": {"name": "delegate_task",
+                                                    "arguments": "{}"}}]},
+             {"role": "tool", "tool_call_id": "delegate-2",
+              "content": json.dumps(empty)}]
+    master.on_turn_complete(messages + later)
+    assert [record.kind for record in
+            master.log.range(0, master.log.count() - 1)].count("work") == 2
+    child.log.close()
+    master.log.close()

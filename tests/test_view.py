@@ -331,3 +331,18 @@ def test_compaction_view_has_its_own_sawtooth(tmp_path):
         assert len(view.lines()) == i + 1
         previous = context
     assert batches > 1
+
+
+def test_view_save_syncs_the_directory_like_a_checkpoint(tmp_path, monkeypatch):
+    """A view publication uses the same durable replacement as a checkpoint
+    publication: fsync'd temporary, atomic rename, and the directory sync that
+    makes the rename itself durable."""
+    from optchat import persistence
+
+    synced = []
+    monkeypatch.setattr(persistence, "sync_directory", lambda path: synced.append(path))
+    view = View(Tree(tmp_path))
+    view.save()
+
+    assert tmp_path in synced
+    assert json.loads((tmp_path / "view.json").read_text(encoding="utf-8"))["version"] == 2
