@@ -66,3 +66,51 @@ cleared when the checkpoint advances.
 Already implemented in Order 1 (P3b): silent for an empty chat; for a chat with records, a loud
 warning naming the consequence, a rebuild from the tree's saved nodes only, and a `"recovered"`
 marker that later loads read. Nothing further to decide.
+
+---
+
+# Revision 2 - after the challenge (2026-10-11)
+
+Codex challenged D1-D5. The verdicts that change them:
+
+**D5 is REVERSED.** The paragraph above is wrong, and so is Order 1's implementation of it:
+reconstructing from the tree's saved nodes **is reconstruction**, which AGENTS.md and plan revision 2
+both forbid, and it does not recover the previous pair selection, batch state, or retained contexts.
+**P3b must be redone**: exact-state recovery, or an explicit unavailable-state outcome - never
+automatic reconstruction - and CONTRACT revision 12's clause must be amended.
+
+**D2 needs a host-owned identity or a correlation mechanism.** End-of-turn reconciliation alone
+reopens duplication: ingest a UID-less row provisionally, the host persists it under a UID, crash
+before reconciliation, restart presents the UID while the engine knows only the provisional one -
+ingesting it duplicates the occurrence, and matching by content can suppress a distinct identical
+one (the host itself warns that distinct messages can share content, timestamp and tool-call ids).
+The suffix invariant is supported by this assembly implementation but **not guaranteed by the
+interface**: canonicalizing the live suffix, filtering rows, or inserting an ephemeral row breaks it,
+and it is already false as a statement about the final wire request, because sanitization and
+user-merge run *after* selection. So: pursue an explicit host-supplied boundary or source-to-request
+mapping, keep version-specific conformance checks, and never claim to have proven the host's anchor
+correct.
+
+**D4's count delta is unsound as the whole protocol** - see the steer sent to the implementation:
+`Log.count()` counts id positions including refused ones, and another append path (`notes.py`) can
+interleave inside the range, attributing somebody else's record to this row and losing one of ours.
+It must become a validated transaction: occurrence identity, a validated contiguous prefix, provable
+range ownership, and an explicit recovery **failure** on a refused position, a mismatch, or an
+impossible delta. "Replay never happens" is unsupported until then.
+
+**D4's lost-boundary clause**: resume after the last **proven contiguous committed occurrence
+boundary**, never after the newest content match - a later, distinct row with identical text can skip
+intervening rows and the new occurrence. With no evidence, preserve the unresolved interval and
+report unavailable recovery.
+
+**D3**: keep the rendered bytes, but one snapshot per **logical turn and reading scope** -
+reassembly, provider retry, failover and steering do not create a new one. Recompute the request
+boundary and the current tail on each assembly while reusing the frozen view bytes; persist the
+snapshot before current-turn ingestion if a restart must resume that same turn; a missing snapshot on
+same-turn recovery is an explicit unavailable state; and a child captures its **own immutable
+snapshot** of the master's view rather than holding the live object. Call it "selected for the turn",
+not "actually served" - selection precedes sanitization, cache decoration and sending.
+
+**D1**: describe capabilities and failure behaviour **per route**, not by branch name. The seam host
+still sends the original transcript after two refusals and fails open on ordinary selection
+exceptions, which can violate the view-only continuity law.

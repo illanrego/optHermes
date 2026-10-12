@@ -22,6 +22,17 @@ Where it stands:
 - Orders 1 and 4 of the plan are **DONE and merged to main** (Order 1: 07d5fa8 → f548c0d; Order 4:
   0fa9f67 plus the host gate 81af99c011 in the seam worktree). Their worktrees are removed and
   nothing is in flight. Main is at 57332b7 with 225 tests green.
+- **Order 0's decisions are written and then challenged** - `docs/DECISIONS.md`, revision 2. Read it
+  before touching orders 2/3/5, because the challenge reversed one of them:
+  - **D5 reversed**: Order 1's P3b reconstructs the view from the tree's saved nodes, which IS
+    reconstruction and is forbidden by AGENTS.md and plan revision 2. **P3b must be redone** as
+    exact-state recovery or an explicit unavailable-state outcome, and CONTRACT revision 12's clause
+    amended.
+  - D2 needs a host-owned occurrence identity or a durable correlation mechanism; the suffix
+    invariant is supported by this assembly but not guaranteed by the interface.
+  - D4's count delta is unsound alone (refused positions count; `notes.py` can interleave) - it must
+    become a validated transaction with provable range ownership and explicit recovery failure.
+  - D3 is one snapshot per logical turn and reading scope; D1 describes capabilities per route.
 
 FIRST, check that state:
 
