@@ -41,9 +41,12 @@ aside for the session - selection returns ``None``, the observation hooks no-op,
 and the navigation tools answer with an explicit error - instead of retrying the
 failed start per turn (CONTRACT.md revision 15).
 
-The retained request tail starts at the host's ``incoming_message`` when that
-message is present in the request (identity first, then equality). Otherwise it
-starts at the last user row. A later steering user row stays in the same turn.
+With ``turn_boundary``, the tail is exactly the host's selection-entry suffix.
+The selected rendering is durable and immutable per logical turn and reading
+scope. Notifications preceding selection capture it before ingestion, associated
+with the first unconsumed user UID until the host supplies the full turn key.
+Without a boundary, the legacy identity/equality/last-user fallback and live
+render remain unchanged; diagnostics explicitly identify that limited route.
 
 Navigation is scope-explicit. An integer id without a scope resolves against the
 log whose view the caller is reading - the master's, for the master and for a
@@ -102,6 +105,7 @@ from .store import Log
 from .text import split_for_kind
 from .tree import Tree
 from .view import PLACEHOLDER, View, ViewStateUnavailable
+from .turn_view import TurnView, TurnViewUnavailable
 from . import tools as opt_tools
 
 
@@ -309,6 +313,7 @@ class OptChatEngine(ContextEngine):
         self.view: View | None = None
         self.compactor: Compactor | None = None
         self._master_view: View | None = None
+        self._master_render: str | None = None
         self._master_log: Log | None = None
         self._master_tree: Tree | None = None
         self._chat_root = self.root
@@ -327,6 +332,10 @@ class OptChatEngine(ContextEngine):
         # The view state was found unavailable at session start: serve nothing for
         # this chat this session instead of retrying the failed start per turn.
         self._session_unavailable = False
+        self._selection_unavailable = False
+        self._snapshot_required = False
+        self._warned_turn_conformance = False
+        self.selection_status: dict[str, Any] = {}
         # Delegate results already resolved, keyed by row fingerprint - by a
         # selection of the running turn or by ingestion itself: ``_arrived_rows``
         # guards against resolving a row twice, ``_arrived_records`` carries a
@@ -391,13 +400,15 @@ class OptChatEngine(ContextEngine):
             # its own. The split happens once; a later call for the same child must
             # not re-capture the child's own objects as the master's.
             if self._master_view is None and self._chat_root == self.root:
-                self._master_view = self.view
+                self._master_view = copy.copy(self.view)
                 if self._master_view is None:
                     # The master's view state is required, not optional: a missing
                     # view.json raises ViewStateUnavailable here instead of letting
                     # the child silently serve its own (empty) view as the master's.
                     self._master_view = View(Tree(self.root, self.node_bytes, read_only=True),
                                              self.view_min_bytes, self.view_max_bytes)
+                self._master_view._pairs = list(self._master_view._pairs)
+                self._master_render = self._master_view.render()
             if self._master_log is None and self._chat_root == self.root and self.log is not None:
                 self._master_log = self.log
                 self._master_tree = self.tree
@@ -406,6 +417,9 @@ class OptChatEngine(ContextEngine):
                 return
             self.log = self.tree = self.view = self.compactor = None
             self._chat_root = child_root
+            self._selection_unavailable = False
+            self._snapshot_required = False
+            self.selection_status = {}
         elif self.log is not None:
             return
         self.log = Log(self._chat_root)
@@ -505,9 +519,11 @@ class OptChatEngine(ContextEngine):
                 or len(identities) != min(rows, CHECKPOINT_ROWS)):
             return {"unavailable": "recovery unavailable: malformed checkpoint envelope"}
         inflight = _load_inflight(raw.get("inflight"))
+        self._snapshot_required |= raw.get("turn_snapshot_required") is True
         committed = raw.get("committed_count")
         self._committed_count = committed
         return {"rows": rows, "identities": identities,
+                "turn_snapshot_required": raw.get("turn_snapshot_required", False),
                 "committed_count": committed,
                 "inflight": inflight,
                 "inflight_malformed": raw.get("inflight") is not None and inflight is None,
@@ -669,6 +685,8 @@ class OptChatEngine(ContextEngine):
         atomic_json(self._checkpoint_path(),
                     {"session": self._session_id, "rows": rows,
                      "identity_version": 2, "identities": recent[-CHECKPOINT_ROWS:],
+                     "turn_snapshot_required": self._snapshot_required or
+                         (self._chat_root / "turn-selection.json").exists(),
                      "committed_count": self._committed_count,
                      "inflight": inflight, "lost": lost, "failure": failure})
 
@@ -716,7 +734,30 @@ class OptChatEngine(ContextEngine):
                        conversation_messages: list[dict[str, Any]] | None = None,
                        incoming_message: dict[str, Any] | None = None,
                        budget_tokens: int = 0,
-                       tools: list[dict[str, Any]] | None = None) -> list[dict[str, Any]] | None:
+                       tools: list[dict[str, Any]] | None = None,
+                       turn_boundary: Any = None, **kwargs: Any) -> list[dict[str, Any]] | None:
+        """Select host-owned current-turn payloads and a durable frozen rendering.
+
+        Boundary-less callers retain the legacy selection path. Serialize the
+        entire boundary-aware operation with ingestion, including rendering.
+        """
+        if self._session_unavailable or self._selection_unavailable:
+            return None
+        arguments = dict(conversation_messages=conversation_messages,
+                         incoming_message=incoming_message, budget_tokens=budget_tokens,
+                         tools=tools, turn_boundary=turn_boundary, **kwargs)
+        if turn_boundary is None:
+            return self._select_context(request_messages, **arguments)
+        log, _, _, _ = self._open()
+        with log._append_lock:
+            return self._select_context(request_messages, **arguments)
+
+    def _select_context(self, request_messages: list[dict[str, Any]], *,
+                       conversation_messages: list[dict[str, Any]] | None = None,
+                       incoming_message: dict[str, Any] | None = None,
+                       budget_tokens: int = 0,
+                       tools: list[dict[str, Any]] | None = None,
+                       turn_boundary: Any = None, **kwargs: Any) -> list[dict[str, Any]] | None:
         """Select the request's context for this call (see CONTRACT.md).
 
         ``tools`` is the request's outgoing schemas as the host hands them over
@@ -726,16 +767,30 @@ class OptChatEngine(ContextEngine):
         fires. Nothing is invented for ``None``: the navigation fallback and its
         one-time warning stay in force.
         """
-        if self._session_unavailable:
+        if self._session_unavailable or self._selection_unavailable:
             # The chat's view state is unavailable: serve nothing (the host keeps
             # its own request) instead of retrying the failed start per turn.
             return None
         if tools is not None:
             self._capture_turn_tools(tools)
+        self.selection_status = {"boundary": "host" if turn_boundary is not None else "absent",
+                                 "conformance": "unchecked", "snapshot": "legacy"}
+        if turn_boundary is None:
+            logger.debug("OptChat turn boundary unavailable: using the legacy incoming-message "
+                         "fallback; logical-turn ownership and frozen-view guarantees are limited")
+        else:
+            if (any(not isinstance(getattr(turn_boundary, field, None), str)
+                    or not getattr(turn_boundary, field) for field in
+                    ("session_id", "turn_id", "reading_scope_id", "incoming_uid"))
+                    or type(getattr(turn_boundary, "request_start", None)) is not int
+                    or not 0 <= turn_boundary.request_start < len(request_messages)):
+                self._unavailable_selection("malformed host turn boundary")
+                return None
+            self._check_turn_boundary(turn_boundary, request_messages, conversation_messages)
         if not request_messages:
             return None
-        turn_start = None
-        if incoming_message is not None:
+        turn_start = turn_boundary.request_start if turn_boundary is not None else None
+        if turn_start is None and incoming_message is not None:
             turn_start = next((i for i, message in enumerate(request_messages)
                                if message is incoming_message), None)
             if turn_start is None:
@@ -764,7 +819,7 @@ class OptChatEngine(ContextEngine):
             if content != original:
                 system[0]["content"] = content
         turn = [copy.deepcopy(message) for message in request_messages[turn_start:]]
-        _, tree, view, compactor = self._open()
+        log, tree, view, compactor = self._open()
         # A delegate result is visible in the running turn's request before the
         # turn completes; registering it here makes the report zoomable by name
         # in the same turn.
@@ -803,8 +858,93 @@ class OptChatEngine(ContextEngine):
         # first user row, exactly as it delivers its own per-turn notes).
         runtime = ([{"role": "user", "content": runtime_block}]
                    if runtime_block is not None else [])
-        return system + [{"role": "assistant", "content": (
-            self._master_view or view).render()}] + runtime + turn
+        rendered = self._master_render if self._master_render is not None else view.render()
+        if turn_boundary is not None:
+            try:
+                if turn_boundary.session_id != self._session_id:
+                    raise TurnViewUnavailable("boundary session does not match the engine session")
+                self._check_snapshot_evidence()
+                rendered = TurnView(self._chat_root).select(
+                    turn_boundary, rendered=rendered, count=log.count(),
+                    can_capture=self._can_capture_turn(turn_boundary, conversation_messages))
+                self.selection_status["snapshot"] = "selected"
+            except (TurnViewUnavailable, OSError, ValueError) as exc:
+                self._unavailable_selection(str(exc))
+                return None
+        return system + [{"role": "assistant", "content": rendered}] + runtime + turn
+
+    def _check_turn_boundary(self, boundary: Any, request: list[dict[str, Any]],
+                             source: list[dict[str, Any]] | None) -> None:
+        """Selection-entry check for seam 202e30e78f; exact payloads are host-owned.
+
+        This checks occurrence uniqueness AND suffix cardinality. It cannot prove
+        host admission, row order or transformations that the API copy has lost.
+        """
+        if source is None:
+            self.selection_status["conformance"] = "source unavailable"
+            return
+        indices = [i for i, row in enumerate(source)
+                   if row.get("message_uid") == boundary.incoming_uid]
+        agrees = (len(indices) == 1 and len(request) - boundary.request_start
+                  == len(source) - indices[0])
+        self.selection_status["conformance"] = "agrees" if agrees else "disagrees"
+        if not agrees and not self._warned_turn_conformance:
+            self._warned_turn_conformance = True
+            logger.warning("OptChat turn-boundary conformance disagreement (seam 202e30e78f): "
+                           "admitted UID uniqueness or suffix arithmetic failed; retaining the "
+                           "HOST boundary for this exact request, never the text reanchor")
+
+    def _can_capture_turn(self, boundary: Any, source: list[dict[str, Any]] | None) -> bool:
+        """Only a proven not-yet-ingested admission can use a new live render.
+
+        Existing selected/pending snapshots do not need this permission. Legacy
+        streams without source evidence cannot promise a pre-turn rendering.
+        """
+        if self.log.count() == 0:
+            return True
+        state = TurnView(self._chat_root).state()
+        if (state is not None and state["phase"] == "complete"
+                and state["session"] == boundary.session_id
+                and state["count"] == self.log.count()):
+            # Completion is independent evidence: no row has been appended
+            # since the last turn ended. A conformance warning is not a veto.
+            return True
+        if source is None:
+            return False
+        indices = [i for i, row in enumerate(source)
+                   if row.get("message_uid") == boundary.incoming_uid]
+        checkpoint = self._load_checkpoint()
+        if (len(indices) != 1 or checkpoint is None or checkpoint.get("unavailable")
+                or checkpoint.get("lost") or checkpoint.get("failure")
+                or checkpoint.get("inflight_malformed")):
+            return False
+        # No payload matching is used to authorize snapshot capture.
+        identities = checkpoint["identities"]
+        if not identities or any(item["kind"] != "uid" for item in identities):
+            return False
+        positions = [[i for i, row in enumerate(source) if row.get("message_uid") == item["value"]]
+                     for item in identities]
+        if any(len(matches) != 1 for matches in positions):
+            return False
+        ordered = [matches[0] for matches in positions]
+        if any(right != left + 1 for left, right in zip(ordered, ordered[1:])):
+            return False
+        return (indices[0] > ordered[-1] and checkpoint.get("inflight") is None
+                and checkpoint["committed_count"] == self.log.count())
+
+    def _unavailable_selection(self, reason: str) -> None:
+        self.selection_status.update(snapshot="unavailable", reason=reason)
+        if not self._selection_unavailable:
+            logger.error("OptChat selected view unavailable: %s. Stepping aside for this session; "
+                         "the host may send its original transcript; safe refusal needs host support",
+                         reason)
+        self._selection_unavailable = True
+
+    def _check_snapshot_evidence(self) -> None:
+        checkpoint = self._load_checkpoint()
+        if (checkpoint is not None and checkpoint.get("turn_snapshot_required")
+                and not (self._chat_root / "turn-selection.json").exists()):
+            raise TurnViewUnavailable("snapshot association required by ingestion is missing")
 
     def get_tool_schemas(self) -> list[dict[str, Any]]:
         integer = {"type": "integer"}
@@ -1160,6 +1300,20 @@ class OptChatEngine(ContextEngine):
         log, tree, view, compactor = self._open()
         chat_root = self._chat_root or self.root
         assert chat_root is not None
+        if start < end:
+            try:
+                self._check_snapshot_evidence()
+                first = messages[start]
+                uid = first.get("message_uid") if first.get("role") == "user" else None
+                if not isinstance(uid, str) or not uid:
+                    uid = None
+                TurnView(chat_root).before_ingest(
+                    self._master_render if self._master_render is not None else view.render(),
+                    session=self._session_id, uid=uid, count=log.count())
+            except (TurnViewUnavailable, OSError, ValueError) as exc:
+                # Raw logging still proceeds. A lost snapshot disables selection,
+                # not the append-only source of truth or its recovery protocol.
+                self._unavailable_selection(str(exc))
         recent = list(checkpoint["identities"]) if checkpoint else []
         lost = checkpoint.get("lost") if checkpoint else None
         marker = checkpoint.get("inflight") if checkpoint else None
@@ -1337,6 +1491,11 @@ class OptChatEngine(ContextEngine):
         tree.save()
         view.merge_batch(log.count())
         view.save()
+        if not self._selection_unavailable:
+            try:
+                TurnView(self._chat_root).complete(count=log.count())
+            except (TurnViewUnavailable, OSError, ValueError) as exc:
+                self._unavailable_selection(str(exc))
         if usage is not None:
             self.update_from_response(usage)
 
@@ -1367,11 +1526,15 @@ class OptChatEngine(ContextEngine):
             self.log, self.tree, self.view, self.compactor)
         clone._chat_root = self._chat_root
         clone._master_view = self._master_view
+        clone._master_render = self._master_render
         clone._master_log = self._master_log
         clone._master_tree = self._master_tree
         clone._session_id = self._session_id
         clone._writes = self._writes
         clone._session_unavailable = self._session_unavailable
+        clone._selection_unavailable = self._selection_unavailable
+        clone._snapshot_required = self._snapshot_required
+        clone.selection_status = dict(self.selection_status)
         clone._turn_system = self._turn_system
         clone._turn_tools = self._turn_tools
         clone._has_turn_tools = self._has_turn_tools

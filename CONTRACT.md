@@ -1005,3 +1005,145 @@ unchanged. UID-less restart examples now distinguish durable-UID resume, unique
 provisional reconciliation, and explicit ambiguity refusal. The changed-tail
 example refuses a missing committed boundary instead of selecting an earlier
 content match. Neither logging nor persisted-view recovery is rebuilt.
+
+---
+
+# Revision 18 - UID turn boundaries and frozen selected views (2026-10-12)
+
+Order 3 (P2a/P3a), consuming the `TurnBoundary` seam reviewed at
+`202e30e78f` in `feat/context-engine-seams`. This supersedes the original
+`select_context` tail rule **when a boundary is supplied**, and revision 11's
+live rendering for that route. Revision 15's missing persisted-view outcome and
+revisions 16-17's ingestion recovery rules remain in force.
+
+## Request boundary and conformance
+
+`select_context(..., tools=None, turn_boundary=None, **kwargs)` accepts the
+host's boundary structurally, without requiring that newer host class at import
+time. Its five fields are `session_id`, `turn_id`, `reading_scope_id`,
+`incoming_uid`, and `request_start`. A supplied valid boundary selects exactly a
+deep copy of `request_messages[request_start:]`. Later steering stays in that
+suffix; the engine never reanchors to it, searches its text, or reconstructs API
+payloads from persistence rows. The system/runtime handling remains unchanged.
+
+When `conversation_messages` is supplied, the engine checks **both** uniqueness
+of `incoming_uid` in `message_uid` and the selection-entry suffix equation:
+
+```
+len(request_messages) - request_start == len(conversation_messages) - source_index
+```
+
+Disagreement emits one warning per engine and sets
+`selection_status["conformance"] = "disagrees"`; it does not replace or veto the
+host's coordinate. An unavailable pre-turn snapshot can independently prevent
+selection. Missing source is `"source unavailable"`, not a successful check.
+The version-specific test pins the reviewed ABC and assembly files by SHA-256;
+changes require re-review. It does not execute or manufacture host integration
+rows. Occurrence ordering and exact transformed payloads remain host-side
+conformance responsibilities, covered by the seam's own tests. This engine check
+is not proof of admission ownership, ordered API provenance or final-wire bytes.
+Malformed boundaries and mismatched engine sessions are explicitly unavailable.
+
+Without a boundary, the original identity-first, then whole-dictionary-equality,
+then last-user fallback and live-render behavior are preserved. Selected request
+bytes are unchanged for that route (apart from the intentional child freezing
+below). A debug diagnostic appears on every boundary-less selection and
+`selection_status["boundary"]` is `"absent"`; it is `"host"` otherwise. No
+boundary warning is emitted on the successful boundary route. These fallback
+coordinates are never represented as a host boundary. In particular, stock hosts
+cannot promise logical-turn ownership or frozen view bytes across reassembly.
+Unknown future keyword arguments are tolerated.
+
+## Capture point, identity, and byte lifetime
+
+On first selection before ingestion, free settling runs as before; the engine
+captures the rendered string, encoded as UTF-8 for its integrity digest. It
+persists that string and the complete host turn association before selection
+returns. Selection and append notifications share the log's append mutex, so
+capture cannot race current-turn ingestion. All subsequent selections of that
+session/turn/scope reuse the saved string; only the host-supplied suffix is
+selected afresh. Placeholders resolving, live-view append/merge, steering and
+repeated assemblies cannot alter the snapshot. This is **selected for the turn**,
+not proof of what a provider actually received.
+
+If `on_message` runs first, `_ingest_rows` captures the render **before its first
+append**, associated with the session and the first unconsumed user row's durable
+UID. This pending capture is reused across later notifications. First selection
+binds it to the full turn/scope key only if its UID matches the host's admitted
+UID. Thus the pre-ingestion bytes and occurrence association are durable before
+current-turn ingestion, even though the host does not supply the logical turn ID
+or reading scope to notifications. No text search or provisional content hash
+binds a pending snapshot. A UID-less or otherwise unprovable pending association
+cannot authorize reuse after ingestion; the selection is explicitly unavailable.
+
+A new turn can capture the current render if no records have been appended since
+successful completion, the log is empty, or the durable committed UID suffix in
+the supplied source proves that admission has not been ingested. This last check
+requires unique, ordered, contiguous retained UIDs, no in-flight row or unresolved
+recovery condition, and agreement between committed count and log count. It is
+not a substitute for full host source-order provenance. If notifications for a
+new turn arrive before its boundary **and** the previous completion was omitted,
+the engine cannot distinguish those rows from steering: it refuses to invent a
+new pre-turn rendering after those rows have already entered the live view.
+
+## Snapshot storage, restart, and unavailability
+
+The owning chat stores two bounded replacement files, via fsync, atomic rename
+and directory sync:
+
+- `turn-selection.json`: version 1, phase (`pending`, `selected`, `complete`),
+  session, admitted UID, logical turn, reading-scope IDs, capture record count,
+  and SHA-256 of the rendered UTF-8 bytes.
+- `turn-render.json`: the exact rendered string. Each scope in the association
+  refers to that immutable capture; scopes in this engine read the same chat
+  source. A child has a separate store under its own chat root. There is no
+  cross-engine or global snapshot registry.
+
+The association is published **first**, then the render, both before appends.
+A crash between publications produces explicit unavailability, never a silent
+re-render. Missing, unreadable, malformed or digest-mismatched snapshot evidence
+is likewise unavailable. New ingestion checkpoints also retain
+`turn_snapshot_required` so loss of both snapshot files after ingestion cannot
+masquerade as a fresh capture. This flag is only evidence that association state
+must exist; it does not claim durable host occurrence ownership.
+
+A restart of the same turn reads and validates the persisted rendering, including
+pending UID captures when first selection never happened. It does not derive the
+snapshot from the advanced live view or reconstruct pairs. Successful completion
+retires the render (JSON `null`) and clears scope IDs, retaining only the latest
+association as a tombstone; an attempted resume of that retired turn is explicitly
+unavailable. A new proven turn replaces the old association, so storage is bounded
+by one rendering and the active turn's scope IDs, never the number of past turns.
+The reviewed host supplies one reading scope per logical turn.
+
+Snapshot failure logs one loud error and sets
+`selection_status["snapshot"] = "unavailable"` with a reason. Selection returns
+`None` for the rest of that engine session; raw ingestion/recovery continues to
+preserve records, and missing snapshot evidence is not repaired. This is a
+selection-specific step-aside outcome. Revision 15's missing `view.json` still
+steps aside for **all** hooks and navigation exactly as before. The engine does
+not raise `ContextSelectionBlocked`: the host's ordinary fail-open and two-refusal
+routes may still send the transcript. Safe refusal requires host support.
+
+## Children and remaining evidence limits
+
+At child session start, copy the master's current rendered string and pair list;
+do not retain its live view object as the selected view. The child uses its own
+immutable string and, with a boundary, its own persisted session/turn/scope
+association. Later master append, merge or node completion cannot change that
+string. Navigation may still read the master's append-only log and tree. On
+same-turn restart the child's saved render wins over the newly opened master's
+current rendering. Missing master persisted-view state remains revision 15's
+explicit unavailable start outcome.
+
+Engine tests cover exact supplied tails, steering, warning frequency, fallback
+bytes, placeholder resolution, live merges, early notification capture,
+publication interruption, same-turn restart, missing/corrupt snapshot state,
+retirement, reading scopes and child isolation. Existing view-plus-zoom and cache
+prefix tests remain in the suite. No live provider, real refusal/failover,
+post-selection sanitizer or physical power-loss validation is claimed. Host
+restoration of logical turn/scope IDs and durable pre-observation identity for all
+rows remain host requirements. A notification containing old unconsumed history
+before admission, UID-less pre-selection rows, or unavailable legacy checkpoint
+evidence can make capture unavailable. Total loss of all independent metadata is
+not detectable as a particular former turn without external host evidence.
