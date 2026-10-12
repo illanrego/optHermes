@@ -18,7 +18,7 @@ from optchat.engine import _record_digest, _row_fingerprint
 from optchat.prompts import SYSTEM_PROMPT
 from optchat.store import Log
 from optchat.tree import Tree
-from optchat.view import View
+from optchat.view import View, ViewStateUnavailable
 
 
 class FakeSummarizer:
@@ -1279,7 +1279,8 @@ def test_recovery_extends_the_view_when_the_tree_is_ahead_of_it(tmp_path):
     recovered.log.close()
 
 
-def test_missing_view_state_on_a_chat_with_records_warns_and_records_recovery(tmp_path):
+def test_missing_view_state_on_a_chat_with_records_is_explicit_and_writes_nothing(
+        tmp_path, caplog):
     engine = OptChatEngine(tmp_path, summarize=FakeSummarizer())
     engine.on_session_start("session")
     engine.on_turn_complete([{"role": "user", "content": "first"}])
@@ -1287,14 +1288,46 @@ def test_missing_view_state_on_a_chat_with_records_warns_and_records_recovery(tm
     (tmp_path / "view.json").unlink()
 
     restarted = OptChatEngine(tmp_path, summarize=FakeSummarizer())
-    with pytest.warns(RuntimeWarning, match="view state is missing") as caught:
+    with caplog.at_level(logging.ERROR, logger="optchat.engine"):
+        with pytest.raises(ViewStateUnavailable, match="view state is unavailable"):
+            restarted.on_session_start("session")
+
+    assert restarted.view is None
+    assert restarted.log is None
+    assert not (tmp_path / "view.json").exists()       # nothing is written
+    loud = [record for record in caplog.records
+            if "OptChat failed to start" in record.getMessage()
+            and "view state is unavailable" in record.getMessage()]
+    assert len(loud) == 1
+
+
+def test_an_unavailable_view_state_steps_the_engine_aside_for_the_session(tmp_path):
+    engine = OptChatEngine(tmp_path, summarize=FakeSummarizer())
+    engine.on_session_start("session")
+    engine.on_turn_complete([{"role": "user", "content": "first"}])
+    engine.log.close()
+    (tmp_path / "view.json").unlink()
+
+    restarted = OptChatEngine(tmp_path, summarize=FakeSummarizer())
+    with pytest.raises(ViewStateUnavailable):
         restarted.on_session_start("session")
 
-    assert "cache entries are gone" in str(caught[0].message)
-    assert restarted.view.render() == "<chat>\n0+1|user: first\n</chat>"
-    data = json.loads((tmp_path / "view.json").read_text(encoding="utf-8"))
-    assert data["recovered"] is True
-    restarted.log.close()
+    # The selection serves nothing: the host keeps its own request.
+    request = [{"role": "system", "content": "s"}, {"role": "user", "content": "hi"}]
+    assert restarted.select_context(request) is None
+    # The observation hooks no-op instead of retrying the failed start.
+    restarted.on_message([{"role": "user", "content": "hi"}],
+                         {"role": "user", "content": "hi"})
+    restarted.on_turn_complete([{"role": "user", "content": "hi"}])
+    # The navigation tools answer with an explicit error.
+    payload = json.loads(restarted.handle_tool_call("optchat_zoom", {"id": 0, "n": 1}))
+    assert "not active" in payload["error"]
+    # A clone carries the same state instead of failing.
+    clone = restarted.clone_for_agent()
+    assert clone.select_context(request) is None
+    # Nothing was opened, ingested, or written.
+    assert restarted.log is None
+    assert not (tmp_path / "view.json").exists()
 
 
 def test_missing_view_state_on_an_empty_chat_is_silent(tmp_path):
@@ -1310,24 +1343,46 @@ def test_missing_view_state_on_an_empty_chat_is_silent(tmp_path):
 
     assert not [item for item in caught if "view" in str(item.message)]
     assert restarted.view.render() == "<chat>\n</chat>"
+    data = json.loads((tmp_path / "view.json").read_text(encoding="utf-8"))
+    assert data["pairs"] == []
+    assert "recovered" not in data
     restarted.log.close()
 
 
-def test_missing_view_state_on_a_chat_with_records_but_no_saved_nodes_warns(tmp_path):
+def test_missing_view_state_on_a_chat_with_records_but_no_saved_nodes_raises(tmp_path):
     # Records exist, but no tree node was ever saved and view.json is missing:
     # still an explicit outcome, never a silent empty view.
     with Log(tmp_path) as log:
         log.append("user", "first")
 
     restarted = OptChatEngine(tmp_path, summarize=FakeSummarizer())
-    with pytest.warns(RuntimeWarning, match="view state is missing"):
+    with pytest.raises(ViewStateUnavailable, match=r"has 1 record\(s\)"):
         restarted.on_session_start("session")
+    assert not (tmp_path / "view.json").exists()
 
-    data = json.loads((tmp_path / "view.json").read_text(encoding="utf-8"))
-    assert data["recovered"] is True
-    assert restarted.view._end() == 1   # recovery covered the record
-    assert restarted.view.render() == "<chat>\n0+1|user: first\n</chat>"
-    restarted.log.close()
+
+def test_a_child_refuses_to_start_when_the_master_view_state_is_missing(tmp_path):
+    engine = OptChatEngine(tmp_path, summarize=FakeSummarizer())
+    engine.on_session_start("master", platform="cli")
+    engine.on_turn_complete([{"role": "user", "content": "first"}])
+    engine.log.close()
+    (tmp_path / "view.json").unlink()
+
+    # A restarted master steps aside; its clone reaches the capture with no view
+    # object in hand, and the missing master state is explicit, not a silent
+    # fallback to the child's own empty view.
+    master = OptChatEngine(tmp_path, summarize=FakeSummarizer())
+    with pytest.raises(ViewStateUnavailable):
+        master.on_session_start("master", platform="cli")
+
+    child = master.clone_for_agent()
+    with pytest.raises(ViewStateUnavailable, match="view state is unavailable"):
+        child.on_session_start("child-session", platform="subagent")
+
+    assert child._session_unavailable
+    assert child.select_context([{"role": "user", "content": "hi"}]) is None
+    assert not (tmp_path / "agents" / "child-session").exists()
+    assert not (tmp_path / "view.json").exists()
 
 
 def test_scoped_and_named_navigation_do_not_seal_a_child_tree_tail(tmp_path):
@@ -1413,6 +1468,8 @@ def test_a_refused_level0_node_does_not_block_session_start_or_later_appends(tmp
     with Log(tmp_path) as log:
         log.append("user", "one")
         log.append("user", "two")
+    # The view state exists (empty legacy pairs); recovery extends its coverage.
+    (tmp_path / "view.json").write_text("[]", encoding="utf-8")
     path = tmp_path / "tree" / "2026-10-11.jsonl"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps({"l": 0, "i": 0, "text": "bad", "size": 999}) + "\n",
@@ -1587,6 +1644,8 @@ def test_recovery_refuses_a_refused_position_in_the_inflight_range(tmp_path):
                           "size": 7, "date": date}) + "\n"
         with (tmp_path / "main" / (date[:10] + ".jsonl")).open("ab") as stream:
             stream.write(bad.encode("utf-8"))
+    # The view state exists (empty legacy pairs); recovery extends its coverage.
+    (tmp_path / "view.json").write_text("[]", encoding="utf-8")
     (tmp_path / "ingest.json").write_text(json.dumps(_marker_checkpoint(row, expected)),
                                           encoding="utf-8")
 
@@ -1618,6 +1677,8 @@ def test_recovery_refuses_a_content_mismatch_in_the_inflight_range(tmp_path):
     with Log(tmp_path) as log:
         log.append("tool", expected[0])
         log.append("note", "a foreign append")  # interleaved inside the range
+    # The view state exists (empty legacy pairs); recovery extends its coverage.
+    (tmp_path / "view.json").write_text("[]", encoding="utf-8")
     (tmp_path / "ingest.json").write_text(json.dumps(_marker_checkpoint(row, expected)),
                                           encoding="utf-8")
 
@@ -1646,6 +1707,8 @@ def test_recovery_refuses_an_impossible_delta(tmp_path):
         for text in expected:
             log.append("tool", text)
         log.append("note", "one append too many")
+    # The view state exists (empty legacy pairs); recovery extends its coverage.
+    (tmp_path / "view.json").write_text("[]", encoding="utf-8")
     (tmp_path / "ingest.json").write_text(json.dumps(_marker_checkpoint(row, expected)),
                                           encoding="utf-8")
 
@@ -1669,6 +1732,8 @@ def test_recovery_refuses_a_malformed_marker_and_keeps_refusing(tmp_path):
     failure that stays recorded, never dropped as if the row were complete."""
     with Log(tmp_path) as log:
         log.append("tool", "partial record")
+    # The view state exists (empty legacy pairs); recovery extends its coverage.
+    (tmp_path / "view.json").write_text("[]", encoding="utf-8")
     (tmp_path / "ingest.json").write_text(json.dumps({
         "session": "session", "rows": 0, "fingerprints": [],
         "inflight": {"fingerprint": "not-a-real-row", "count_before": 0},

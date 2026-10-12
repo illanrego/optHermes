@@ -815,3 +815,51 @@ atomic rename, directory sync), so a view publication is as durable as a checkpo
 media index is written the same way. A delegate result with `status="dispatched"` that carries a
 nonempty `inline_results` list is ingested as the `work` records it carries (one per completed
 entry); a dispatched payload with nothing completed inline still produces no records.
+
+---
+
+# Revision 15 - missing view state is an explicit unavailable outcome (2026-10-11)
+
+Plan Order 1's P3b, redone after the challenge reversed D5 (`docs/DECISIONS.md`, revision 2).
+This supersedes revision 12's "Missing view state" section: the rebuild from the tree's saved
+nodes is removed. It was reconstruction - it did not restore the previous pair selection, the
+batch state, or the retained compaction contexts - and AGENTS.md forbids rebuilding the view.
+
+## What recovery is, and what it is not
+
+The view is recovered **only by extension, and only when its state exists**: `_recover` extends
+coverage for every id position at or beyond the view's end (revision 12, unchanged). Exact-state
+recovery of a **missing** `view.json` is impossible from the surviving artifacts: the pair
+selection and the batch state depend on when batches ran against built nodes, which is never
+recorded, and the retained compaction contexts exist only in `view.json`. A derived pair list
+would be a different state wearing this chat's name, so the code does not attempt one - recorded
+here as a decision, not an omission.
+
+## The unavailable-state outcome
+
+A missing `view.json` is handled as follows:
+
+- A chat with **no records and no saved tree nodes** builds the empty view silently; an owning
+  load saves it, a foreign (read-only) load does not write.
+- Otherwise - records exist, or saved tree nodes exist when the caller cannot know the record
+  count - `View` raises `ViewStateUnavailable`, naming the chat root and the consequence.
+  **Nothing is written**: no pairs, no marker, no `view.json` is created; the state stays
+  exactly as found, so restoring `view.json` from a backup resumes the chat.
+- The engine surfaces the condition through its start path: one loud error line for the
+  session, after which it **steps aside** - `select_context` returns `None` (the host keeps
+  its own request), the observation hooks no-op, the navigation tools answer with an explicit
+  "not active" error, and a clone carries the same state - instead of retrying the failed
+  start on every call.
+- Host behaviour is separate and is not a guarantee: the installed host catches
+  `on_session_start` exceptions at debug level (`agent/agent_init.py`) and fails open on
+  selection exceptions, sending the unmodified request (`agent/conversation_loop.py`). The
+  engine does not claim a safe refusal; its loud line in the profile log is the signal, and
+  fail-closed behaviour remains an upstream gap (`docs/FINDINGS.md`).
+- A child's session-start capture of the master's view no longer silently skips a missing
+  master `view.json` (which let the child serve its own empty view as the master's): it raises
+  the same explicit error. Scoped navigation keeps its tool-level error.
+
+## The `recovered` marker is retired
+
+`view.json` no longer carries a `recovered` key, and the loader ignores the key in a legacy
+file (only the retired rebuild path ever wrote it). Otherwise the version-2 schema is unchanged.

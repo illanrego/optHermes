@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -27,6 +26,16 @@ def due(l: int, i: int, T: int) -> float:
     return (T - ((i + 2) * (1 << l) - 1)) / (1 << l)
 
 
+class ViewStateUnavailable(RuntimeError):
+    """The view state cannot be served because it is missing, and it is never rebuilt.
+
+    A rebuilt view is a different state wearing the chat's name: the previous pair
+    selection, the batch state and the retained compaction contexts are not recoverable
+    from the log or the tree. Nothing is written by this outcome; restoring view.json
+    from a backup is what makes the chat serviceable again.
+    """
+
+
 class View:
     def __init__(self, tree: Tree, min_bytes: int = 64_000, max_bytes: int = 128_000,
                  *, records: int | None = None):
@@ -37,17 +46,14 @@ class View:
         self.tree = tree
         self.min_bytes = min_bytes
         self.max_bytes = max_bytes
-        # The chat's record count when its owner knows it: missing view state in a
-        # chat that has records is an explicit outcome even when no tree node was
-        # ever saved. ``None`` when the caller cannot know (a foreign read).
+        # The chat's record count when its owner knows it: a missing view.json on a
+        # chat that has records (or saved tree nodes, when the caller cannot know
+        # the count) is an explicit unavailable state, never a rebuild. ``None``
+        # when the caller cannot know (a foreign read).
         self._records = records
         self._pairs: list[tuple[int, int]] = []
         self._batch_pending = False
         self._compaction_views: dict[tuple[int, int], _CompactionView] = {}
-        # True when this view was rebuilt from the tree because view.json was
-        # missing on a chat that had records; the marker is persisted so a later
-        # load can see that the recovery happened.
-        self._recovered = False
         self.load()
 
     def add_root(self, i: int) -> None:
@@ -187,7 +193,6 @@ class View:
         # itself durable. A view publication is as durable as a checkpoint.
         atomic_json(path, {"version": 2, "pairs": self._pairs,
                            "batch_pending": self._batch_pending,
-                           "recovered": self._recovered,
                            "compaction_views": [
                                {"min_bytes": minimum, "max_bytes": maximum,
                                 "pairs": state.pairs, "batch_pending": state.batch_pending,
@@ -197,39 +202,33 @@ class View:
 
     def load(self) -> None:
         path = Path(self.tree.root) / "view.json"
-        self._recovered = False
         if not path.exists():
             nodes = self.tree.nodes()
             if not nodes and not self._records:
                 # A chat with no records: nothing was saved, nothing is lost, and
-                # the empty view is the correct view. Built silently.
+                # the empty view is the correct view. Built silently; a foreign
+                # (read-only) read does not write it.
                 self._pairs = []
-                self.save()
+                if not self.tree._read_only:
+                    self.save()
                 return
-            # The design forbids rebuilding a view: a rebuilt view renders
-            # differently and every cache entry for this chat dies. Missing state
-            # in a chat that has records is an explicit outcome, not a normal load:
-            # say what was lost, rebuild the closest available view from the tree's
-            # saved nodes (never from the log), and record the recovery in
-            # view.json so a later load can see that it happened.
-            warnings.warn(
-                f"OptChat view state is missing for {self.tree.root}: view.json is "
-                "gone, so the view state is lost and this chat's cache entries are "
-                "gone. Rebuilding the closest available view from the tree's saved "
-                "nodes; the rebuild does not restore the lost state.",
-                RuntimeWarning, stacklevel=2)
-            end = max(((i + 1) << l for l, i in nodes), default=0)
-            pairs = []
-            cursor = 0
-            while cursor < end:
-                choices = ((l, i) for l, i in nodes if (i << l) == cursor and ((i + 1) << l) <= end)
-                pair = max(choices, key=lambda item: item[0], default=(0, cursor))
-                pairs.append(pair)
-                cursor += 1 << pair[0]
-            self._pairs = pairs
-            self._recovered = True
-            self.save()
-            return
+            # Missing state in a chat that has records (or saved tree nodes, when
+            # the caller cannot know the record count) is an explicit unavailable
+            # state. The view is never rebuilt: a rebuilt view is a different
+            # state, and the previous pair selection, batch state and retained
+            # compaction contexts are not recoverable from the log or the tree.
+            # Nothing is written, so a restored view.json resumes the chat.
+            if self._records:
+                detail = f"and this chat has {self._records} record(s)"
+            else:
+                detail = "and saved tree nodes exist for this chat"
+            raise ViewStateUnavailable(
+                f"OptChat view state is unavailable for {self.tree.root}: "
+                f"view.json is missing {detail}. The view is never rebuilt - a "
+                "rebuilt view is a different state (pair selection, batch state "
+                "and retained compaction contexts are not recoverable), and "
+                "serving it would silently replace this chat's memory. Nothing "
+                "was written; restore view.json from a backup to resume this chat.")
         raw = json.loads(path.read_text(encoding="utf-8"))
         self._compaction_views = {}
         self._batch_pending = False
@@ -240,10 +239,8 @@ class View:
             raise ValueError("Invalid view.json version")
         self._pairs = self._read_pairs(raw["pairs"])
         self._batch_pending = self._read_pending(raw["batch_pending"])
-        recovered = raw.get("recovered", False)
-        if type(recovered) is not bool:
-            raise ValueError("Invalid view recovery marker")
-        self._recovered = recovered
+        # A legacy "recovered" marker (written only by the retired rebuild path)
+        # is ignored; nothing reads or writes it anymore.
         for item in raw["compaction_views"]:
             minimum, maximum = item["min_bytes"], item["max_bytes"]
             if (type(minimum) is not int or type(maximum) is not int

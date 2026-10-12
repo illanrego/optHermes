@@ -36,6 +36,13 @@ strictly worse than a view that still carries placeholders (CONTRACT.md revision
 11). A turn served with an unsettled view logs one debug line; a settled one is
 silent.
 
+A missing view state is an explicit unavailable outcome, never a rebuild: ``View``
+raises ``ViewStateUnavailable`` for a chat that has records (or saved tree nodes,
+when the caller cannot know the count), nothing is written, and the engine steps
+aside for the session - selection returns ``None``, the observation hooks no-op,
+and the navigation tools answer with an explicit error - instead of retrying the
+failed start per turn (CONTRACT.md revision 15).
+
 The retained request tail starts at the host's ``incoming_message`` when that
 message is present in the request (identity first, then equality). Otherwise it
 starts at the last user row. A later steering user row stays in the same turn.
@@ -96,7 +103,7 @@ from .prompts import SYSTEM_PROMPT
 from .store import Log
 from .text import split_for_kind
 from .tree import Tree
-from .view import PLACEHOLDER, View
+from .view import PLACEHOLDER, View, ViewStateUnavailable
 from . import tools as opt_tools
 
 
@@ -298,6 +305,9 @@ class OptChatEngine(ContextEngine):
         self._warned_recovery_failure = False
         self._warned_child_conflicts: set[str] = set()
         self._start_failure_logged = False
+        # The view state was found unavailable at session start: serve nothing for
+        # this chat this session instead of retrying the failed start per turn.
+        self._session_unavailable = False
         # Delegate results already resolved, keyed by row fingerprint - by a
         # selection of the running turn or by ingestion itself: ``_arrived_rows``
         # guards against resolving a row twice, ``_arrived_records`` carries a
@@ -318,9 +328,16 @@ class OptChatEngine(ContextEngine):
         return "optchat"
 
     def on_session_start(self, session_id: str, **kwargs: Any) -> None:
+        self._session_unavailable = False
         try:
             self._start_session(session_id, **kwargs)
         except Exception as exc:
+            # A missing view state (ViewStateUnavailable) is permanent for this
+            # chat: mark the session unavailable so selection and the observation
+            # hooks step aside instead of retrying the failed start on every call.
+            # Every other failure keeps the existing retry-through-_open behaviour.
+            if isinstance(exc, ViewStateUnavailable):
+                self._session_unavailable = True
             # The host catches this and logs at debug level, so the failure must be
             # loud here: the session then runs without OptChat and its guarantee.
             if not self._start_failure_logged:
@@ -356,7 +373,10 @@ class OptChatEngine(ContextEngine):
             # not re-capture the child's own objects as the master's.
             if self._master_view is None and self._chat_root == self.root:
                 self._master_view = self.view
-                if self._master_view is None and (self.root / "view.json").is_file():
+                if self._master_view is None:
+                    # The master's view state is required, not optional: a missing
+                    # view.json raises ViewStateUnavailable here instead of letting
+                    # the child silently serve its own (empty) view as the master's.
                     self._master_view = View(Tree(self.root, self.node_bytes, read_only=True),
                                              self.view_min_bytes, self.view_max_bytes)
             if self._master_log is None and self._chat_root == self.root and self.log is not None:
@@ -670,6 +690,10 @@ class OptChatEngine(ContextEngine):
         fires. Nothing is invented for ``None``: the navigation fallback and its
         one-time warning stay in force.
         """
+        if self._session_unavailable:
+            # The chat's view state is unavailable: serve nothing (the host keeps
+            # its own request) instead of retrying the failed start per turn.
+            return None
         if tools is not None:
             self._capture_turn_tools(tools)
         if not request_messages:
@@ -814,6 +838,9 @@ class OptChatEngine(ContextEngine):
             return json.dumps({"error": "tool arguments must be an object"})
         if name not in ("optchat_zoom", "optchat_date"):
             return json.dumps({"error": f"Unknown context engine tool: {name}"})
+        if self._session_unavailable:
+            return json.dumps({"error": "OptChat is not active for this session: "
+                                        "the view state is unavailable"})
         self._open()
         scope = args.get("scope")
         if scope is not None and (not isinstance(scope, str) or not scope):
@@ -1183,6 +1210,8 @@ class OptChatEngine(ContextEngine):
         Fail-open: anything unexpected leaves the turn untouched, and
         ``on_turn_complete`` reconciles at the boundary.
         """
+        if self._session_unavailable:
+            return
         self._open()
         if not self._writes:
             return
@@ -1211,6 +1240,8 @@ class OptChatEngine(ContextEngine):
 
     def on_turn_complete(self, messages: list[dict[str, Any]], usage: dict[str, Any] | None = None,
                          **kwargs: Any) -> None:
+        if self._session_unavailable:
+            return
         # _open() first: an engine whose session never started learns its context there
         # (on_session_start("") defaults to a primary, writable context).
         log, tree, view, compactor = self._open()
@@ -1270,7 +1301,8 @@ class OptChatEngine(ContextEngine):
         self.last_total_tokens = usage.get("total_tokens", 0) or 0
 
     def clone_for_agent(self) -> OptChatEngine:
-        self._open()
+        if not self._session_unavailable:
+            self._open()
         clone = type(self)(self.root, view_min_bytes=self.view_min_bytes,
                            view_max_bytes=self.view_max_bytes, node_bytes=self.node_bytes,
                            summarize=self.summarize)
@@ -1282,6 +1314,7 @@ class OptChatEngine(ContextEngine):
         clone._master_tree = self._master_tree
         clone._session_id = self._session_id
         clone._writes = self._writes
+        clone._session_unavailable = self._session_unavailable
         clone._turn_system = self._turn_system
         clone._turn_tools = self._turn_tools
         clone._has_turn_tools = self._has_turn_tools

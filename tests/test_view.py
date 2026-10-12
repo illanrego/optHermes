@@ -4,7 +4,7 @@ import warnings
 import pytest
 
 from optchat.tree import Tree
-from optchat.view import View, due
+from optchat.view import View, ViewStateUnavailable, due
 
 
 def push(new_state, states):
@@ -121,27 +121,25 @@ def test_settled_tracks_placeholder_lines(tmp_path):
     assert view.settled()
 
 
-def test_missing_view_on_a_chat_with_nodes_warns_and_records_the_recovery(tmp_path):
+def test_missing_view_on_a_chat_with_nodes_is_an_unavailable_state(tmp_path):
     tree = Tree(tmp_path)
     tree.put(0, 0, "a")
     tree.put(0, 1, "b")
     tree.put(1, 0, "a\nb")
     tree.save()
-    # view.json is gone (never written, or lost); the tree kept its nodes.
-    with pytest.warns(RuntimeWarning, match="view state is missing") as caught:
-        view = View(tree)
-    assert "cache entries are gone" in str(caught[0].message)
-    assert [(line.l, line.i) for line in view.lines()] == [(1, 0)]
-    data = json.loads((tmp_path / "view.json").read_text(encoding="utf-8"))
-    assert data["recovered"] is True
+    # view.json is gone (lost, or never written); the tree kept its nodes. The
+    # state is unavailable and is never rebuilt: nothing is written, and the
+    # failure repeats until the state is restored.
+    with pytest.raises(ViewStateUnavailable, match="view state is unavailable") as caught:
+        View(tree)
+    message = str(caught.value)
+    assert str(tmp_path) in message
+    assert "never rebuilt" in message
+    assert "Nothing was written" in message
+    assert not (tmp_path / "view.json").exists()
 
-    # A later load sees the recorded recovery and does not warn again.
-    with warnings.catch_warnings(record=True) as later:
-        warnings.simplefilter("always")
-        loaded = View(Tree(tmp_path))
-    assert not [item for item in later if "view state" in str(item.message)]
-    assert loaded._recovered is True
-    assert [(line.l, line.i) for line in loaded.lines()] == [(1, 0)]
+    with pytest.raises(ViewStateUnavailable):
+        View(Tree(tmp_path))
 
 
 def test_missing_view_on_an_empty_chat_is_silent(tmp_path):
@@ -151,7 +149,37 @@ def test_missing_view_on_an_empty_chat_is_silent(tmp_path):
         view = View(tree)
     assert not [item for item in caught if "view" in str(item.message)]
     assert view.render() == "<chat>\n</chat>"
-    assert json.loads((tmp_path / "view.json").read_text(encoding="utf-8"))["recovered"] is False
+    data = json.loads((tmp_path / "view.json").read_text(encoding="utf-8"))
+    assert data["version"] == 2 and data["pairs"] == []
+    assert "recovered" not in data   # the rebuilt-marker is retired
+
+
+def test_missing_view_on_a_chat_with_records_is_an_unavailable_state(tmp_path):
+    # The caller knows the record count; nothing was ever saved.
+    with pytest.raises(ViewStateUnavailable, match=r"has 3 record\(s\)"):
+        View(Tree(tmp_path), records=3)
+    assert not (tmp_path / "view.json").exists()
+
+
+def test_missing_view_on_an_empty_foreign_read_does_not_write(tmp_path):
+    # A foreign read of a chat that looks empty builds the empty view without
+    # creating view.json through the read-only tree.
+    view = View(Tree(tmp_path, read_only=True))
+    assert view.render() == "<chat>\n</chat>"
+    assert not (tmp_path / "view.json").exists()
+
+
+def test_a_legacy_recovered_marker_loads_and_is_retired_on_save(tmp_path):
+    tree = Tree(tmp_path)
+    tree.put(0, 0, "first")
+    (tmp_path / "view.json").write_text(json.dumps({
+        "version": 2, "pairs": [[0, 0]], "batch_pending": False,
+        "recovered": True, "compaction_views": []}), encoding="utf-8")
+    view = View(tree)
+    assert [(line.l, line.i) for line in view.lines()] == [(0, 0)]
+    view.save()
+    data = json.loads((tmp_path / "view.json").read_text(encoding="utf-8"))
+    assert "recovered" not in data
 
 
 def test_context_view_merges_further_without_changing_live_pairs(tmp_path):
