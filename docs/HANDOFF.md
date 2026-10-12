@@ -19,15 +19,18 @@ Where it stands:
   feat/context-engine-seams (commit cf1743d63a): tools to select_context, ContextSelectionBlocked,
   and on_message. They are NOT merged into any running host, and there are NO PRs - the user's rule
   is that nothing goes upstream until he has tested it on his terms.
-- Orders 1, 2 and 4 of the plan are **DONE and merged to main** (Order 1: 07d5fa8 → f548c0d;
-  Order 2: 6dcfa92; Order 4: 0fa9f67 plus the host gate 81af99c011 in the seam worktree). Worktrees
-  removed, nothing in flight. Main is at HEAD with 245 tests green, CONTRACT revisions 12-15 in order.
+- Orders 1, 2 and 4 of the plan are **DONE and merged to main** (Order 1: 07d5fa8 → f548c0d; Order 2:
+  6dcfa92; Order 4: 0fa9f67 plus the host gate 81af99c011 in the seam worktree). Main is at HEAD with
+  295 tests green, CONTRACT revisions 12-17 in order. The second challenge's D2/D4 verdicts are
+  applied: recovery hardened (56e857c, Order 2b) and identity-first (dbd4633, Order 2c).
+- The fourth seam - the logical-turn boundary (`turn_boundary`) - landed on the seam worktree branch
+  `feat/context-engine-seams` at `202e30e78f`.
 - **P3b has been redone** (commit 8fa8cb9, CONTRACT revision 15): the rebuild is cut, and a missing view
   state is an explicit unavailable outcome - ViewStateUnavailable, nothing written, the engine steps
   aside for the session. Exact-state recovery of a missing view.json is impossible from the surviving
   artifacts; revision 15 records that as a decision, not an omission.
-- **Order 0's decisions are written and then challenged** - `docs/DECISIONS.md`, revision 2. Read it
-  before touching orders 2/3/5, because the challenge reversed one of them:
+- **Order 0's decisions are written and challenged twice** - `docs/DECISIONS.md`, revisions 2-3 (the
+  second pass's D2/D4 verdicts are applied). Read them before touching orders 3/5:
   - **D5 reversed**: Order 1's P3b reconstructs the view from the tree's saved nodes, which IS
     reconstruction and is forbidden by AGENTS.md and plan revision 2. **P3b is redone** as the
     explicit unavailable-state outcome (commit 8fa8cb9); CONTRACT revision 12's clause is superseded by
@@ -44,13 +47,11 @@ FIRST, check that state:
 
 What is next, in the plan's order:
 
-- The D2/D4 challenge pass on the written decisions (D2: the host's current-turn suffix invariant;
-  D4: the recovery protocol) - held for Codex's reset, as before.
-- Order 3 (P2a, P3a): the turn boundary by UID, and the frozen served view. P2a leans on D2, so its
-  implementation absorbs that challenge pass.
+- Order 3 (P2a, P3a) is next: the brief is ready and launches immediately - the engine consumes the
+  boundary seam with conformance checks, and the selected view is frozen per logical turn and scope.
 - Order 5 (P4a, P4b): the compaction's request identity, then the cache measurements.
 - Then a LIVE RUN. The engine has not been exercised inside a real host since WP4, and that run is
-  also the gate for merging the host seams (seam worktree: `feat/context-engine-seams` at 81af99c011).
+  also the gate for merging the host seams (seam worktree: `feat/context-engine-seams` at 202e30e78f).
 
 Rules the user holds me to:
 
