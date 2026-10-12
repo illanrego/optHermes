@@ -23,7 +23,8 @@ Where it stands:
  6dcfa92; Order 4: 0fa9f67 plus the host gate 81af99c011 in the seam worktree). Main is at HEAD with
  329 tests green, CONTRACT revisions 12-18 in order. The second challenge's D2/D4 verdicts are
  applied (56e857c Order 2b, dbd4633 Order 2c), and Order 3 landed as b27e94c - UID turn boundaries
- with conformance checks and a durable, frozen selected view per logical turn and scope.
+ with conformance checks and a durable, frozen selected view per logical turn and scope; Order 5's engine side landed as 609b527 (CONTRACT
+ revision 19 - compaction roles shaped like a turn, engine-side prefix overlaps measured).
 - The fourth seam - the logical-turn boundary (`turn_boundary`) - landed on the seam worktree branch
   `feat/context-engine-seams` at `202e30e78f`.
 - **P3b has been redone** (commit 8fa8cb9, CONTRACT revision 15): the rebuild is cut, and a missing view
@@ -48,10 +49,10 @@ FIRST, check that state:
 
 What is next, in the plan's order:
 
-- Order 5 (P4a, P4b): the compaction's request shape, then the prefix comparison and the cache
-  measurements (the live-wire measurement rides the live run).
-- Then a LIVE RUN. The engine has not been exercised inside a real host since WP4, and that run is
+- The LIVE RUN. The engine has not been exercised inside a real host since WP4, and that run is
   also the gate for merging the host seams (seam worktree: `feat/context-engine-seams` at 202e30e78f).
+  The wire measurements (turn->turn, turn->compaction, compaction->compaction `cache_read_tokens`)
+  ride that run.
 
 Rules the user holds me to:
 
@@ -68,7 +69,9 @@ The three findings that justify the plan:
 
 1. A compaction cannot read a turn's cache entry: it sends [system][user: view + task] where a turn
    sends [system][assistant: view][user: turn]. The roles differ at the same position, so the
-   prefixes diverge before tools or cache marks can matter. Fix: P4a.
+   prefixes diverge before tools or cache marks can matter. **Fixed:** 609b527 (CONTRACT revision 19 -
+   the envelope now matches; the engine-side prefix numbers are recorded there, the live-wire
+   measurement rides the live run).
 2. The turn-boundary fix (WP1) is inert against the real host: rows carry stamped persistence fields,
    the API copy has them stripped, and the engine is handed an unstripped clone - so identity and
    equality both fail and it falls back to the last user row. The durable field is message_uid
