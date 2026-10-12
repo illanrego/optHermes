@@ -7,6 +7,7 @@ import sys
 import types
 
 from optchat import OptChatEngine
+from optchat.media import retry_pending_media
 from optchat.store import Log
 from optchat.tools import zoom
 from optchat.tree import Tree
@@ -232,3 +233,100 @@ def test_envelope_media_still_never_enters_log_view_or_compaction(tmp_path, monk
     assert encoded not in engine.view.render()
     assert all(encoded not in request.task and encoded not in request.context
                for request in summarizer.requests)
+
+
+# --- Order 2 (P1d): a failed media reference is preserved and retried ----------
+
+
+def test_failed_media_reference_is_recorded_and_retried_by_a_later_pass(tmp_path, caplog):
+    """A media read that fails while the row checkpoint advances leaves its
+    reference recorded; a later pass retries it and archives the bytes."""
+    missing = tmp_path / "later-image.png"
+    engine = OptChatEngine(tmp_path, summarize=RecordingSummarizer())
+    with caplog.at_level(logging.WARNING, logger="optchat.media"):
+        engine.on_turn_complete([{"role": "user", "content": [
+            {"type": "text", "text": "See image"},
+            {"type": "image", "path": str(missing), "mime_type": "image/png"}]}])
+
+    assert "reference recorded for retry" in caplog.text
+    pending = json.loads((tmp_path / "assets" / "pending.json").read_text(encoding="utf-8"))
+    assert len(pending) == 1
+    assert pending[0]["message_id"] == 0 and pending[0]["part_index"] == 1
+    assert pending[0]["reference"] == str(missing)
+    assert "cannot read" in pending[0]["error"]
+    assert json.loads(engine.handle_tool_call("optchat_zoom", {"id": 0}))["media"] == []
+
+    # The file appears later; the next session start is a later pass that retries
+    # the recorded reference and archives it.
+    missing.write_bytes(b"late image")
+    engine.log.close()
+    restarted = OptChatEngine(tmp_path, summarize=RecordingSummarizer())
+    restarted.on_session_start("session")
+    assert (tmp_path / "assets" / "0-1.png").read_bytes() == b"late image"
+    assert json.loads(restarted.handle_tool_call("optchat_zoom", {"id": 0}))["media"] == [
+        {"path": "assets/0-1.png", "type": "image"}]
+    assert json.loads((tmp_path / "assets" / "pending.json").read_text(encoding="utf-8")) == []
+    restarted.log.close()
+
+
+def test_invalid_payload_leaves_its_reference_recorded_for_a_retry(tmp_path):
+    """An unparseable payload is not dropped: its reference is recorded, and a
+    retry attempt is counted even when the payload stays undecodable."""
+    engine = OptChatEngine(tmp_path, summarize=RecordingSummarizer())
+    broken = "data:image/png;base64,%%%"
+    engine.on_turn_complete([{"role": "user", "content": [
+        {"type": "image_url", "image_url": {"url": broken}}]}])
+
+    pending = json.loads((tmp_path / "assets" / "pending.json").read_text(encoding="utf-8"))
+    assert [entry["reference"] for entry in pending] == [broken]
+    assert "invalid data URL" in pending[0]["error"]
+
+    assert retry_pending_media(tmp_path) == {"archived": 0, "pending": 1, "remote": 0}
+    pending = json.loads((tmp_path / "assets" / "pending.json").read_text(encoding="utf-8"))
+    assert pending[0]["reference"] == broken and pending[0]["attempts"] == 2
+    engine.log.close()
+
+
+def test_remote_media_reference_survives_a_retry(tmp_path):
+    """A remote URL has no local payload; the reference survives verbatim. A
+    retry would fetch the bytes - that capability is a separate, open item - so
+    the entry is kept exactly as recorded."""
+    engine = OptChatEngine(tmp_path, summarize=RecordingSummarizer())
+    url = "https://example.invalid/picture.png"
+    engine.on_turn_complete([{"role": "user", "content": [
+        {"type": "image_url", "image_url": {"url": url}}]}])
+
+    pending = json.loads((tmp_path / "assets" / "pending.json").read_text(encoding="utf-8"))
+    assert pending[0]["reference"] == url
+    assert "remote URL" in pending[0]["error"]
+
+    assert retry_pending_media(tmp_path) == {"archived": 0, "pending": 1, "remote": 1}
+    pending = json.loads((tmp_path / "assets" / "pending.json").read_text(encoding="utf-8"))
+    assert pending[0]["reference"] == url and pending[0]["attempts"] == 1
+    engine.log.close()
+
+
+def test_index_failure_is_recorded_and_retried(tmp_path, monkeypatch):
+    """A media index write that fails is not swallowed while the row checkpoint
+    advances: the archived entries are recorded and a later pass re-indexes them."""
+    from optchat import media as media_module
+
+    engine = OptChatEngine(tmp_path, summarize=RecordingSummarizer())
+    real_merge = media_module._merge_index
+
+    def failing_merge(_root, _message_id, _entries):
+        raise OSError("index is not writable")
+
+    monkeypatch.setattr(media_module, "_merge_index", failing_merge)
+    engine.on_turn_complete([{"role": "user", "content": [_image(b"bytes")]}])
+    monkeypatch.setattr(media_module, "_merge_index", real_merge)
+
+    pending = json.loads((tmp_path / "assets" / "pending.json").read_text(encoding="utf-8"))
+    assert [entry["type"] for entry in pending] == ["index"]
+    assert pending[0]["entries"] == [{"path": "assets/0-0.png", "type": "image"}]
+    assert json.loads(engine.handle_tool_call("optchat_zoom", {"id": 0}))["media"] == []
+
+    assert retry_pending_media(tmp_path) == {"archived": 1, "pending": 0, "remote": 0}
+    assert json.loads(engine.handle_tool_call("optchat_zoom", {"id": 0}))["media"] == [
+        {"path": "assets/0-0.png", "type": "image"}]
+    engine.log.close()

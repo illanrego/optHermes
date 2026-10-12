@@ -14,12 +14,27 @@ warning once per engine.
 
 ``on_message`` ingests each appended message as the turn unfolds, with the same
 classification ``on_turn_complete`` uses; the ingestion checkpoint keeps the
-turn-boundary pass a reconciler, never a duplicate. The engine deliberately
-does not raise ``ContextSelectionBlocked``: selection settles for free before
-rendering, and refusing would make the host send its own original request -
-full transcript plus Hermes' own compression - which is strictly worse than a
-view that still carries placeholders (CONTRACT.md revision 11). A turn served
-with an unsettled view logs one debug line; a settled one is silent.
+turn-boundary pass a reconciler, never a duplicate.
+
+Ingestion is protected by a durable in-flight marker in ``ingest.json``: written
+before a row's records and cleared in the same write as that row's checkpoint
+advance, it holds the row's identity, the log's record count before the row, and
+the record sequence the row is writing (one kind and digest per record). Recovery
+validates the log's records in the marker's range against that sequence, position
+by position, before skipping any of them; a refused position, a content mismatch,
+or a delta beyond the sequence is an explicit recovery failure, never completion.
+The validated remainder is then appended, so a crash never duplicates a record and
+never skips one. The log stays append-only: nothing is ever repaired by deleting
+or rewriting a logged record. A boundary that cannot be found at all is recorded
+once and retried by a later turn from the newest row the engine can still
+identify, instead of freezing on an unchanged checkpoint.
+
+The engine deliberately does not raise ``ContextSelectionBlocked``: selection
+settles for free before rendering, and refusing would make the host send its own
+original request - full transcript plus Hermes' own compression - which is
+strictly worse than a view that still carries placeholders (CONTRACT.md revision
+11). A turn served with an unsettled view logs one debug line; a settled one is
+silent.
 
 The retained request tail starts at the host's ``incoming_message`` when that
 message is present in the request (identity first, then equality). Otherwise it
@@ -75,7 +90,7 @@ except ModuleNotFoundError as exc:
 
 from .compactor import CompactionRequest, Compactor, Summarizer
 from .cache import plan_view_cache
-from .media import MEDIA_TYPES, archive_media, has_media_parts
+from .media import MEDIA_TYPES, archive_media, has_media_parts, retry_pending_media
 from .persistence import atomic_json
 from .prompts import SYSTEM_PROMPT
 from .store import Log
@@ -105,6 +120,47 @@ def _row_fingerprint(message: dict[str, Any]) -> str:
     stable = {key: message.get(key) for key in ("role", "content", "tool_calls", "tool_call_id")}
     payload = json.dumps(stable, sort_keys=True, ensure_ascii=False, default=str)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def _record_digest(kind: str, text: str) -> str:
+    """A stable digest of one record's kind and text, for in-flight validation."""
+    return hashlib.sha256((kind + "\u0000" + text).encode("utf-8")).hexdigest()[:16]
+
+
+class _RecoveryFailure(RuntimeError):
+    """An in-flight range that cannot be validated; recovery must never guess."""
+
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
+
+
+def _load_inflight(raw: Any) -> dict[str, Any] | None:
+    """The durable in-flight marker, or ``None`` when absent or malformed."""
+    if not (isinstance(raw, dict) and isinstance(raw.get("fingerprint"), str)
+            and type(raw.get("count_before")) is int and raw["count_before"] >= 0
+            and isinstance(raw.get("records"), list)
+            and all(isinstance(item, dict) and isinstance(item.get("kind"), str)
+                    and isinstance(item.get("digest"), str) for item in raw["records"])):
+        return None
+    return {"fingerprint": raw["fingerprint"], "count_before": raw["count_before"],
+            "records": [{"kind": item["kind"], "digest": item["digest"]}
+                        for item in raw["records"]]}
+
+
+def _load_lost(raw: Any) -> dict[str, Any] | None:
+    """The recorded lost-boundary anchor, or ``None`` when absent or malformed."""
+    if not (isinstance(raw, dict) and isinstance(raw.get("fingerprint"), str)
+            and type(raw.get("rows")) is int and raw["rows"] >= 0):
+        return None
+    return {"fingerprint": raw["fingerprint"], "rows": raw["rows"]}
+
+
+def _load_failure(raw: Any) -> dict[str, Any] | None:
+    """The recorded recovery failure, or ``None`` when absent or malformed."""
+    if not (isinstance(raw, dict) and isinstance(raw.get("reason"), str)):
+        return None
+    return {"reason": raw["reason"]}
 
 
 def _load_config(root: Path) -> dict[str, Any]:
@@ -239,6 +295,7 @@ class OptChatEngine(ContextEngine):
         self._warned_route_override = False
         self._session_id = ""
         self._warned_ingest_boundary = False
+        self._warned_recovery_failure = False
         self._warned_child_conflicts: set[str] = set()
         self._start_failure_logged = False
         # Delegate results already resolved, keyed by row fingerprint - by a
@@ -324,6 +381,14 @@ class OptChatEngine(ContextEngine):
             self.compactor.system = self._turn_system
             self.compactor.tools = self._turn_tools
             self._recover()
+            try:
+                # A later pass over media that failed to decode or read when its
+                # row was ingested: the reference was recorded, so it can be
+                # tried again. Remote URLs keep their reference (fetching remote
+                # bytes is a separate, open capability).
+                retry_pending_media(self._chat_root)
+            except Exception:
+                logger.exception("OptChat could not retry pending media for %s", self._chat_root)
         except BaseException:
             self.log.close()
             self.log = None
@@ -368,7 +433,14 @@ class OptChatEngine(ContextEngine):
         return self._chat_root / "ingest.json"
 
     def _load_checkpoint(self) -> dict[str, Any] | None:
-        """The stored ingestion boundary for this chat, or ``None``."""
+        """The stored ingestion boundary for this chat, or ``None``.
+
+        The durable in-flight marker, the lost-boundary anchor and the recorded
+        recovery failure ride along. A malformed ``lost``/``failure`` field is
+        dropped (it is advisory); a present-but-malformed marker is kept flagged,
+        because it is evidence of a possibly partial row and must never be
+        silently ignored.
+        """
         try:
             raw = json.loads(self._checkpoint_path().read_text(encoding="utf-8"))
         except (OSError, ValueError):
@@ -379,25 +451,170 @@ class OptChatEngine(ContextEngine):
         if (not isinstance(rows, int) or rows < 0 or not isinstance(fingerprints, list)
                 or not all(isinstance(item, str) for item in fingerprints)):
             return None
-        return {"rows": rows, "fingerprints": fingerprints}
+        inflight = _load_inflight(raw.get("inflight"))
+        return {"rows": rows, "fingerprints": fingerprints,
+                "inflight": inflight,
+                # A present-but-unreadable marker cannot validate anything: it must
+                # never be dropped as if the row were complete (that would re-ingest
+                # a partial row and duplicate its records). It is an explicit failure,
+                # and the raw value is kept so the failure stays recorded and sticky
+                # until the checkpoint is repaired.
+                "inflight_malformed": raw.get("inflight") is not None and inflight is None,
+                "inflight_raw": raw.get("inflight"),
+                "lost": _load_lost(raw.get("lost")),
+                "failure": _load_failure(raw.get("failure"))}
 
     def _resume_row(self, messages: list[dict[str, Any]],
-                    checkpoint: dict[str, Any] | None) -> int | None:
-        """The row to resume at, or ``None`` when the boundary cannot be found."""
-        if checkpoint is None:
-            return 0
-        known = set(checkpoint["fingerprints"])
-        if not known:
-            return checkpoint["rows"] if checkpoint["rows"] <= len(messages) else None
-        for row in range(min(len(messages), checkpoint["rows"]) - 1, -1, -1):
-            if _row_fingerprint(messages[row]) in known:
-                return row + 1
-        return None
+                    checkpoint: dict[str, Any] | None) -> tuple[int, int] | None:
+        """The row to resume at and the records it already wrote, or ``None``.
 
-    def _save_checkpoint(self, rows: int, recent: list[str]) -> None:
+        ``(start, skip)``: ingestion resumes at row ``start``, and that row's
+        first ``skip`` records are already in the log. The boundary is found by
+        row fingerprint; when none matches, a recorded lost-boundary failure lets
+        a later turn retry from the newest row the engine can still identify.
+
+        The durable in-flight marker is validated before anything is skipped:
+        the log's records in its range must match the row's recorded sequence
+        exactly, position by position (kind and digest), and the delta must not
+        exceed that sequence. A refused position, a content mismatch, or an
+        impossible delta raises ``_RecoveryFailure`` - it is never treated as
+        completion - because skipping or replaying an unverified range could
+        lose or duplicate records.
+        """
+        if checkpoint is None:
+            return 0, 0
+        log = self.log
+        assert log is not None  # _resume_row is called through _open()
+        if checkpoint.get("inflight_malformed"):
+            raise _RecoveryFailure("the durable in-flight marker is malformed")
+        known = set(checkpoint["fingerprints"])
+        start = None
+        from_lost = False
+        if known:
+            for row in range(min(len(messages), checkpoint["rows"]) - 1, -1, -1):
+                if _row_fingerprint(messages[row]) in known:
+                    start = row + 1
+                    break
+        elif checkpoint["rows"] <= len(messages):
+            start = checkpoint["rows"]
+        marker = checkpoint.get("inflight")
+        if start is None:
+            lost = checkpoint.get("lost")
+            if isinstance(lost, dict):
+                for row in range(len(messages) - 1, -1, -1):
+                    if _row_fingerprint(messages[row]) == lost["fingerprint"]:
+                        start = row
+                        break
+            if start is None:
+                return None
+            from_lost = True
+        if not isinstance(marker, dict):
+            return start, 0
+        if start >= len(messages) or _row_fingerprint(messages[start]) != marker["fingerprint"]:
+            if from_lost:
+                # The retry anchor is a different row: the in-flight row is gone
+                # from the transcript. Its records stay in the log (append-only);
+                # ingestion resumes at the anchor rather than stalling.
+                return start, 0
+            raise _RecoveryFailure(
+                "the in-flight row is not where the checkpoint boundary places it")
+        expected = marker["records"]
+        delta = log.count() - marker["count_before"]
+        if delta < 0 or delta > len(expected):
+            raise _RecoveryFailure(
+                f"the log holds {delta} record(s) after the in-flight marker, but "
+                f"the row records only {len(expected)}")
+        for offset in range(delta):
+            record = log.get(marker["count_before"] + offset)
+            if record is None:
+                raise _RecoveryFailure(
+                    f"log record {marker['count_before'] + offset} is refused; its "
+                    "payload cannot be validated as the in-flight row's")
+            if (record.kind != expected[offset]["kind"]
+                    or _record_digest(record.kind, record.text) != expected[offset]["digest"]):
+                raise _RecoveryFailure(
+                    f"log record {marker['count_before'] + offset} does not match the "
+                    "in-flight row's record sequence")
+        return start, delta
+
+    def _record_lost_boundary(self, messages: list[dict[str, Any]],
+                              checkpoint: dict[str, Any] | None) -> None:
+        """Record a lost ingestion boundary once; a later turn retries from it.
+
+        The failure is recorded durably in the checkpoint and warned once per
+        engine. The retry anchor is the newest row the engine can still identify:
+        the in-flight marker's row when it survives, else the transcript's newest
+        row - the one row provably not yet ingested, since no recorded fingerprint
+        matches it and nothing is ingested while the boundary is lost. A later
+        turn resumes there instead of freezing on an unchanged checkpoint; the
+        interval before the anchor is not ingested, because guessing a boundary
+        could duplicate history (the recorded failure names it).
+        """
+        if not self._warned_ingest_boundary:
+            self._warned_ingest_boundary = True
+            warnings.warn(
+                "OptChat cannot find its ingestion boundary in this transcript: the "
+                "recorded rows are gone (a compression rewrote them). Ingesting nothing "
+                "this turn rather than guessing a boundary that could duplicate history; "
+                "the failure is recorded and a later turn retries from the newest row it "
+                "can still identify.", RuntimeWarning, stacklevel=2)
+        if not messages:
+            return
+        marker = checkpoint.get("inflight") if isinstance(checkpoint, dict) else None
+        anchor = len(messages) - 1
+        if isinstance(marker, dict):
+            found = next((row for row in range(len(messages) - 1, -1, -1)
+                          if _row_fingerprint(messages[row]) == marker["fingerprint"]), None)
+            if found is not None:
+                anchor = found
+        rows = checkpoint["rows"] if isinstance(checkpoint, dict) else 0
+        fingerprints = checkpoint["fingerprints"] if isinstance(checkpoint, dict) else []
+        self._save_checkpoint(rows, fingerprints, inflight=marker,
+                              lost={"fingerprint": _row_fingerprint(messages[anchor]),
+                                    "rows": len(messages)})
+
+    def _record_recovery_failure(self, failure: _RecoveryFailure,
+                                 checkpoint: dict[str, Any] | None) -> None:
+        """An in-flight range that cannot be validated: loud, durable, no guess.
+
+        Skipping the range could declare inaccessible or foreign records
+        complete; replaying it could duplicate records. The log is append-only,
+        so nothing is repaired by rewriting it: ingestion stops at this row and
+        the failure is recorded in the checkpoint for an operator to inspect.
+        """
+        reason = failure.reason
+        logger.error(
+            "OptChat recovery failed for %s: %s. Ingesting nothing: skipping or "
+            "replaying the unverified in-flight range could lose or duplicate "
+            "records; logged records are never rewritten.",
+            self._checkpoint_path(), reason)
+        if not self._warned_recovery_failure:
+            self._warned_recovery_failure = True
+            warnings.warn(
+                f"OptChat recovery failed: {reason}. Ingesting nothing until the "
+                f"in-flight range is resolved; the failure is recorded in "
+                f"{self._checkpoint_path()}.", RuntimeWarning, stacklevel=2)
+        if isinstance(checkpoint, dict):
+            recorded = checkpoint.get("failure")
+            if not (isinstance(recorded, dict) and recorded.get("reason") == reason):
+                inflight = checkpoint.get("inflight")
+                if checkpoint.get("inflight_malformed"):
+                    # Keep the unreadable marker as it was: dropping it would let a
+                    # later call treat the partial row as complete and duplicate it.
+                    inflight = checkpoint.get("inflight_raw")
+                self._save_checkpoint(checkpoint["rows"], checkpoint["fingerprints"],
+                                      inflight=inflight,
+                                      lost=checkpoint.get("lost"),
+                                      failure={"reason": reason})
+
+    def _save_checkpoint(self, rows: int, recent: list[str], *,
+                         inflight: dict[str, Any] | None = None,
+                         lost: dict[str, Any] | None = None,
+                         failure: dict[str, Any] | None = None) -> None:
         atomic_json(self._checkpoint_path(),
                     {"session": self._session_id, "rows": rows,
-                     "fingerprints": recent[-CHECKPOINT_ROWS:]})
+                     "fingerprints": recent[-CHECKPOINT_ROWS:],
+                     "inflight": inflight, "lost": lost, "failure": failure})
 
     def _check_compaction_route(self) -> None:
         """Report an explicit aux route without changing the host's routing."""
@@ -801,12 +1018,19 @@ class OptChatEngine(ContextEngine):
         except json.JSONDecodeError:
             payload = None
         if isinstance(payload, dict) and payload.get("status") == "dispatched":
-            return []
-        entries = payload.get("results") if isinstance(payload, dict) else None
-        if not isinstance(entries, list):
-            entries = payload.get("inline_results") if isinstance(payload, dict) else None
-        if not isinstance(entries, list):
-            entries = [payload] if isinstance(payload, dict) else [None]
+            # A dispatched call whose units completed inline still carries their
+            # reports (``inline_results``); they are the ``work`` records they
+            # always were, and dropping them would lose the child's report. A
+            # dispatched call with nothing completed inline carries nothing to log.
+            entries = payload.get("inline_results")
+            if not isinstance(entries, list) or not entries:
+                return []
+        else:
+            entries = payload.get("results") if isinstance(payload, dict) else None
+            if not isinstance(entries, list):
+                entries = payload.get("inline_results") if isinstance(payload, dict) else None
+            if not isinstance(entries, list):
+                entries = [payload] if isinstance(payload, dict) else [None]
         work = []
         for entry in entries:
             candidate = entry if isinstance(entry, dict) else {}
@@ -830,21 +1054,52 @@ class OptChatEngine(ContextEngine):
             work.append((label, f"[{label}] {body}", key))
         return work
 
-    def _ingest_rows(self, messages: list[dict[str, Any]], start: int, end: int) -> None:
+    @staticmethod
+    def _validate_resumed_row(records: list[tuple[Any, ...]],
+                              marker: dict[str, Any] | None) -> None:
+        """The recomputed sequence must equal the interrupted attempt's.
+
+        Replay must generate the same records the attempt would have written:
+        splitting depends on ``node_bytes`` and delegate labels on the persisted
+        index. The marker recorded the attempt's sequence, so a divergence (a
+        changed budget, a relabeled child, surrounding context that no longer
+        classifies the row the same way) is an explicit recovery failure instead
+        of a silently different remainder.
+        """
+        expected = marker["records"] if isinstance(marker, dict) else []
+        if len(records) != len(expected) or any(
+                kind != item["kind"] or _record_digest(kind, text) != item["digest"]
+                for (kind, text, _label, _key), item in zip(records, expected)):
+            raise _RecoveryFailure(
+                "the row no longer recomputes to the in-flight record sequence")
+
+    def _ingest_rows(self, messages: list[dict[str, Any]], start: int, end: int, *,
+                     checkpoint: dict[str, Any] | None = None, skip: int = 0) -> None:
         """Append the log records for host rows ``[start, end)``.
 
         The classification is the one ``on_turn_complete`` has always used (call
         ids are tracked while walking, so a tool result is attributed to the call
         it answers); ``on_message`` shares it, so a row's kind never depends on
-        which hook ingested it. The checkpoint advances once per row, after every
-        record of that row is durable, so a crash re-ingests at most the row it
-        was on - never a skipped or duplicated row.
+        which hook ingested it.
+
+        Every row with records is protected by a durable in-flight marker written
+        to the checkpoint *before* its first append and cleared in the same write
+        as the checkpoint advance. The marker holds the row's identity, the log's
+        count before the row, and the record sequence the row is writing; a crash
+        between a record's append and the advance leaves it, and recovery skips
+        exactly the records the log already holds for that row - validated against
+        the marker, position by position - and appends the remainder, so a crash
+        never duplicates a record and never skips one. ``skip`` carries that
+        validated remainder from ``_resume_row`` for the row at ``start``;
+        ``checkpoint`` supplies the boundary base, so rows the retry skipped are
+        never recorded as ingested.
         """
         log, tree, view, compactor = self._open()
         chat_root = self._chat_root or self.root
         assert chat_root is not None
-        recent = [_row_fingerprint(messages[row])
-                  for row in range(max(0, start - CHECKPOINT_ROWS), start)]
+        recent = list(checkpoint["fingerprints"]) if checkpoint else []
+        lost = checkpoint.get("lost") if checkpoint else None
+        marker = checkpoint.get("inflight") if checkpoint else None
         child_index = self._child_index() if self._chat_root == self.root else {}
         known_keys = set(child_index.values())
         tool_names: dict[str, str] = {}
@@ -881,16 +1136,37 @@ class OptChatEngine(ContextEngine):
             else:
                 records = [(kind, text, None, None) for kind, text in
                            self._records(message, self.node_bytes, tool_name)]
+            fingerprint = _row_fingerprint(message)
+            expected = [{"kind": kind, "digest": _record_digest(kind, text)}
+                        for kind, text, _label, _key in records]
+            resumed = row == start and skip > 0
+            if resumed:
+                self._validate_resumed_row(records, marker)
+                # The media archive hangs off the row's first record, which is
+                # already in the log: re-running it is idempotent and repairs a
+                # crash between the first append and the archive.
+                archive_media(chat_root, log.count() - skip, message.get("content"))
+                records = records[skip:]
+            if expected and (not resumed or records):
+                # The durable in-flight marker, written before the first record of
+                # this row and cleared by the advance below. count_before stays the
+                # row's first record id even when resuming a partial row.
+                self._save_checkpoint(row, recent,
+                                      inflight={"fingerprint": fingerprint,
+                                                "count_before": log.count() - (skip if resumed else 0),
+                                                "records": expected},
+                                      lost=lost)
             for record_index, (kind, text, _label, _key) in enumerate(records):
                 index = log.append(kind, text)
-                if record_index == 0:
+                if record_index == 0 and not resumed:
                     archive_media(chat_root, index, message.get("content"))
                 compactor.seed(index, text, kind)
                 view.add_root(index)
-            # Advance only once every record of this row is durable, so a crash
-            # mid-row re-ingests that row instead of skipping its other records.
-            recent.append(_row_fingerprint(message))
-            self._save_checkpoint(row + 1, recent)
+            # The advance clears the marker in the same durable write; a crash
+            # before it leaves the marker, and recovery resumes this row exactly
+            # (never a duplicate record, never a skipped one).
+            recent.append(fingerprint)
+            self._save_checkpoint(row + 1, recent, inflight=None, lost=None)
 
     def on_message(self, messages: list[dict[str, Any]], message: dict[str, Any],
                    **kwargs: Any) -> None:
@@ -901,26 +1177,37 @@ class OptChatEngine(ContextEngine):
         starts at the checkpoint boundary, so rows the host appended without a
         notification (the turn's user row, synthetic nudges) are ingested too;
         the appended row itself is located by equality against the structural
-        clone the host hands over, never assumed to be the last row. Fail-open:
-        anything unexpected leaves the turn untouched, and ``on_turn_complete``
-        reconciles at the boundary.
+        clone the host hands over, never assumed to be the last row. A boundary
+        that cannot be found is recorded once and retried by a later call; an
+        unvalidatable in-flight range is a loud, durable recovery failure.
+        Fail-open: anything unexpected leaves the turn untouched, and
+        ``on_turn_complete`` reconciles at the boundary.
         """
         self._open()
         if not self._writes:
             return
         checkpoint = self._load_checkpoint()
-        start = self._resume_row(messages, checkpoint)
-        if start is None:
-            # The recorded rows are gone (a compression rewrote them). Ingest
-            # nothing here; the turn-complete reconciler warns once instead of
-            # guessing a boundary that could duplicate history.
+        try:
+            resolved = self._resume_row(messages, checkpoint)
+        except _RecoveryFailure as failure:
+            self._record_recovery_failure(failure, checkpoint)
             return
+        if resolved is None:
+            # The recorded rows are gone (a compression rewrote them): record the
+            # failure once; a later call retries from the newest identifiable row
+            # instead of guessing a boundary that could duplicate history.
+            self._record_lost_boundary(messages, checkpoint)
+            return
+        start, skip = resolved
         row = next((index for index in range(len(messages) - 1, -1, -1)
                     if messages[index] == message), None)
         if row is None or start >= row + 1:
             # Not found, or already ingested (a duplicate notification).
             return
-        self._ingest_rows(messages, start, row + 1)
+        try:
+            self._ingest_rows(messages, start, row + 1, checkpoint=checkpoint, skip=skip)
+        except _RecoveryFailure as failure:
+            self._record_recovery_failure(failure, checkpoint)
 
     def on_turn_complete(self, messages: list[dict[str, Any]], usage: dict[str, Any] | None = None,
                          **kwargs: Any) -> None:
@@ -933,19 +1220,26 @@ class OptChatEngine(ContextEngine):
         # identity, not by a counter: a counter resets on restart (re-ingesting
         # everything) and skips a transcript that happens to be the same length.
         checkpoint = self._load_checkpoint()
-        start = self._resume_row(messages, checkpoint)
-        if start is None:
-            if not self._warned_ingest_boundary:
-                self._warned_ingest_boundary = True
-                warnings.warn(
-                    "OptChat cannot find its ingestion boundary in this transcript: the "
-                    "recorded rows are gone (a compression rewrote them). Ingesting nothing "
-                    "this turn rather than guessing a boundary that could duplicate history.",
-                    RuntimeWarning, stacklevel=2)
+        try:
+            resolved = self._resume_row(messages, checkpoint)
+        except _RecoveryFailure as failure:
+            self._record_recovery_failure(failure, checkpoint)
             return
+        if resolved is None:
+            # No recorded row matches: record the failure once and let a later
+            # turn retry from the newest row still identifiable, instead of
+            # freezing on an unchanged checkpoint.
+            self._record_lost_boundary(messages, checkpoint)
+            return
+        start, skip = resolved
         # The reconciler: rows already ingested through on_message are before the
-        # checkpoint boundary, so this walk adds only what it has not seen.
-        self._ingest_rows(messages, start, len(messages))
+        # checkpoint boundary, so this walk adds only what it has not seen; a
+        # validated in-flight remainder resumes at the row that holds it.
+        try:
+            self._ingest_rows(messages, start, len(messages), checkpoint=checkpoint, skip=skip)
+        except _RecoveryFailure as failure:
+            self._record_recovery_failure(failure, checkpoint)
+            return
         # One save per turn, not per record: the log append is already fsync'd per
         # record, and the tree and view are derived state.
         tree.save()
