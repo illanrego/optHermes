@@ -19,9 +19,13 @@ Where it stands:
   feat/context-engine-seams (commit cf1743d63a): tools to select_context, ContextSelectionBlocked,
   and on_message. They are NOT merged into any running host, and there are NO PRs - the user's rule
   is that nothing goes upstream until he has tested it on his terms.
-- Orders 1 and 4 of the plan are **DONE and merged to main** (Order 1: 07d5fa8 → f548c0d; Order 4:
-  0fa9f67 plus the host gate 81af99c011 in the seam worktree). Their worktrees are removed and
-  nothing is in flight. Main is at 57332b7 with 225 tests green.
+- Orders 1, 2 and 4 of the plan are **DONE and merged to main** (Order 1: 07d5fa8 → f548c0d;
+  Order 2: 6dcfa92; Order 4: 0fa9f67 plus the host gate 81af99c011 in the seam worktree). Their
+  worktrees are removed and nothing is in flight. Main is at HEAD with 240 tests green, CONTRACT
+  revisions 12-14 in order.
+- **P3b must be redone** (see D5's reversal below): Order 1's implementation reconstructs the view
+  from the tree's saved nodes, which is forbidden reconstruction. Redo it as exact-state recovery or
+  an explicit unavailable-state outcome, and amend CONTRACT revision 12's clause.
 - **Order 0's decisions are written and then challenged** - `docs/DECISIONS.md`, revision 2. Read it
   before touching orders 2/3/5, because the challenge reversed one of them:
   - **D5 reversed**: Order 1's P3b reconstructs the view from the tree's saved nodes, which IS
