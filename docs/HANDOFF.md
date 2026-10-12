@@ -49,10 +49,17 @@ FIRST, check that state:
 
 What is next, in the plan's order:
 
-- The LIVE RUN. The engine has not been exercised inside a real host since WP4, and that run is
-  also the gate for merging the host seams (seam worktree: `feat/context-engine-seams` at 202e30e78f).
-  The wire measurements (turn->turn, turn->compaction, compaction->compaction `cache_read_tokens`)
-  ride that run.
+- The LIVE RUN: the first pass is DONE and green (2026-10-12). Four turns in one continuous
+  session on the seam build; every turn bound a `TurnBoundary`; snapshots froze and retired;
+  zoom/date round-tripped; wire numbers: turn->turn 9216 cache-read tokens,
+  turn->compaction 7936 across 8 compactions. What
+  remains: your own session on your terms (the upstream gate), a compaction->compaction wire
+  number, and then the seam-merge/PR decision.
+- Live-run recipe: `~/Documents/coding/opthermes-seam/.hermes/bin/hermes -p opthermes-dev -t
+  context_engine` (the checkout's own launcher; bare `hermes` runs the main build with no seams).
+  Continue the ONE continuous session with `--resume <id> chat -q "..."`; a fresh `-q` session on a
+  used engine root is an explicit unavailable state by design (revision 16). Fresh root: rename
+  `<profile>/optchat` aside first. The working session: `--resume 20261012_130047_ff611e`.
 
 Rules the user holds me to:
 

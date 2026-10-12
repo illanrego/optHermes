@@ -207,7 +207,13 @@ Still upstream, not built:
 
 ## The verification milestone
 
-Measure, on the real wire and separately: **turn→turn**, **turn→compaction** and
-**compaction→compaction** reuse, including a growth burst and a merge boundary. The recorded
-16,000/16,363 measurement covers two calls inside one turn only. Restart-safety claims
-additionally require WP6.
+First live pass (2026-10-12, `opthermes-dev` on the opencode-go route, the seam build at
+`202e30e78f` via the checkout's own launcher): one continuous session, four turns, a 26-node merge
+wave. turn→turn: 9,099 new input + 9,216 cache-read on the session's main calls. turn→compaction: 7,936 cache-read across 8 calls (~597/call -
+the shared system/tools prefix; the compaction views had merged independently, so only the earlier
+prefix was reusable, matching the engine-side prediction in CONTRACT revision 19). Every turn
+bound a host `TurnBoundary`; the selected view was frozen, served and retired each turn;
+`optchat_zoom` and `optchat_date` round-tripped live. compaction→compaction reuse (same target)
+still to measure on the wire; the engine-side harness shows a fresh request for the same target is
+byte-identical. Earlier: the recorded 16,000/16,363 measurement covered two calls inside one turn
+only.
