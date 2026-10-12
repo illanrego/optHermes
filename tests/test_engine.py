@@ -127,11 +127,12 @@ def test_missing_tools_warn_once_per_engine_and_keep_fallback(tmp_path):
     for name in ("first", "second"):
         summarizer = FakeSummarizer()
         engine = OptChatEngine(tmp_path / name, summarize=summarizer, node_bytes=16)
-        messages = [{"role": "tool", "content": "long result " * 5}]
+        messages = [{"role": "tool", "content": "long result " * 5,
+                     "message_uid": "first-result"}]
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
             engine.on_turn_complete(messages)
-            engine.on_turn_complete(messages + messages)
+            engine.on_turn_complete(messages + [dict(messages[0], message_uid="second-result")])
         assert len(caught) == 1
         assert caught[0].category is RuntimeWarning
         assert "cache-policy gates cache_plan, the only hook that carries tools" in str(caught[0].message)
@@ -926,11 +927,14 @@ def test_recovery_requeues_a_root_whose_source_was_only_in_memory(tmp_path):
 
 
 def test_ingestion_resumes_across_a_restart_without_duplicating(tmp_path):
-    messages = [{"role": "user", "content": "one"}, {"role": "assistant", "content": "two"}]
+    messages = [{"role": "user", "content": "one", "message_uid": "user-1"},
+                {"role": "assistant", "content": "two", "message_uid": "reply-1"}]
     engine = OptChatEngine(tmp_path, summarize=FakeSummarizer())
     engine.on_session_start("session")
     engine.on_turn_complete(messages)
     assert engine.log.count() == 2
+    assert json.loads((tmp_path / "ingest.json").read_text())["identities"] == [
+        {"kind": "uid", "value": "user-1"}, {"kind": "uid", "value": "reply-1"}]
     engine.log.close()
 
     restarted = OptChatEngine(tmp_path, summarize=FakeSummarizer())
@@ -950,13 +954,15 @@ def test_ingestion_resumes_at_the_right_row_after_a_changed_tail(tmp_path):
     engine.on_turn_complete(messages)
     engine.log.close()
 
-    # Same length, last row rewritten: the boundary is found one row earlier, so the
-    # new text is ingested instead of the whole transcript being skipped.
+    # Same length, last provisional row rewritten: an older match cannot prove
+    # what happened to that occurrence. Preserve the unresolved interval.
     changed = [messages[0], {"role": "assistant", "content": "TWO"}]
     restarted = OptChatEngine(tmp_path, summarize=FakeSummarizer())
     restarted.on_session_start("session")
-    restarted.on_turn_complete(changed)
-    assert [record.text for record in restarted.log.range(0, 2)] == ["one", "two", "TWO"]
+    with pytest.warns(RuntimeWarning, match="cannot find its ingestion boundary"):
+        restarted.on_turn_complete(changed)
+    assert [record.text for record in restarted.log.range(0, 1)] == ["one", "two"]
+    assert json.loads((tmp_path / "ingest.json").read_text())["lost"] is not None
     restarted.log.close()
 
 
@@ -1238,7 +1244,8 @@ def test_on_message_finds_the_appended_row_wherever_it_sits(tmp_path):
 def test_restart_resumes_after_on_message_ingestion_without_gaps(tmp_path):
     """A restart after on_message-only ingestion resumes at the boundary; a row
     appended but never notified is not skipped, and a re-send duplicates nothing."""
-    messages = [{"role": "user", "content": "one"}, {"role": "assistant", "content": "two"}]
+    messages = [{"role": "user", "content": "one", "message_uid": "user-1"},
+                {"role": "assistant", "content": "two", "message_uid": "reply-1"}]
     engine = OptChatEngine(tmp_path, summarize=FakeSummarizer())
     engine.on_session_start("session")
     engine.on_message(messages, copy.deepcopy(messages[-1]))
@@ -1537,7 +1544,8 @@ def test_crash_between_two_of_three_records_resumes_at_the_third(tmp_path):
     assert [engine.log.get(i).text for i in range(2)] == expected[:2]
     checkpoint = json.loads((tmp_path / "ingest.json").read_text(encoding="utf-8"))
     assert checkpoint["rows"] == 0 and checkpoint["inflight"]["count_before"] == 0
-    assert checkpoint["inflight"]["fingerprint"] == _row_fingerprint(row)
+    assert checkpoint["inflight"]["identity"] == {
+        "kind": "provisional", "value": _row_fingerprint(row)}
     assert [item["digest"] for item in checkpoint["inflight"]["records"]] == [
         _record_digest("tool", text) for text in expected]
     engine.log.close()
@@ -1912,8 +1920,8 @@ def test_zero_delta_validates_complete_sequence(tmp_path, monkeypatch, change):
 def test_wrong_count_before_fails_against_committed_frontier(tmp_path, monkeypatch, wrong_start):
     engine = OptChatEngine(tmp_path, summarize=FakeSummarizer())
     engine.on_session_start("session")
-    first = {"role": "user", "content": "X"}
-    second = {"role": "user", "content": "X"}
+    first = {"role": "user", "content": "X", "message_uid": "first"}
+    second = {"role": "user", "content": "X", "message_uid": "second"}
     engine.on_turn_complete([first])
     state = _interrupt_before_first_append(engine, [first, second], monkeypatch)
     assert state["committed_count"] == 1
@@ -2101,3 +2109,269 @@ def test_zero_delta_validation_after_incomplete_json_tail(tmp_path, monkeypatch)
     assert restarted.log.count() == 0
     assert json.loads((tmp_path / "ingest.json").read_text())["inflight"] == original["inflight"]
     restarted.log.close()
+
+
+# Order 2c: occurrence identity, with explicit limits for provisional rows.
+def _identity_engine(root):
+    engine = OptChatEngine(root, summarize=FakeSummarizer())
+    engine.on_session_start("session")
+    engine._capture_turn_tools([])
+    return engine
+
+
+@pytest.mark.parametrize("reconcile_hook", ["on_message", "on_turn_complete"])
+def test_provisional_identity_upgrades_after_restart_without_new_rows(tmp_path, reconcile_hook):
+    rows = [{"role": "user", "content": "task", "message_uid": "task"},
+            {"role": "assistant", "content": "answer"}]
+    engine = _identity_engine(tmp_path)
+    engine.on_message(rows, copy.deepcopy(rows[-1]))
+    state = json.loads((tmp_path / "ingest.json").read_text())
+    assert state["identities"][-1] == {
+        "kind": "provisional", "value": _row_fingerprint(rows[-1])}
+    assert "message_uid" not in rows[-1]  # the engine never stamps the host
+    engine.log.close()
+
+    rows[-1]["message_uid"] = "answer"
+    restarted = _identity_engine(tmp_path)
+    if reconcile_hook == "on_message":
+        restarted.on_message(copy.deepcopy(rows), copy.deepcopy(rows[-1]))
+    else:
+        restarted.on_turn_complete(copy.deepcopy(rows))
+    assert restarted.log.count() == 2
+    assert json.loads((tmp_path / "ingest.json").read_text())["identities"] == [
+        {"kind": "uid", "value": "task"}, {"kind": "uid", "value": "answer"}]
+    restarted.log.close()
+
+    # Prove the upgrade was durable: matching now uses the UID, even when the
+    # committed payload changed, and the new equal-content occurrence is logged.
+    rows[-1]["content"] = "host revised answer"
+    final = _identity_engine(tmp_path)
+    final.on_turn_complete(rows + [{"role": "assistant", "content": "answer",
+                                   "message_uid": "another-answer"}])
+    assert [r.text for r in final.log.range(0, 2)] == ["task", "answer", "answer"]
+    final.log.close()
+
+
+@pytest.mark.parametrize("durable", [False, True])
+def test_equal_content_occurrences_resume_by_uid_or_refuse(tmp_path, durable):
+    first = {"role": "user", "content": "continue"}
+    second = dict(first)
+    if durable:
+        first["message_uid"], second["message_uid"] = "first", "second"
+    engine = _identity_engine(tmp_path)
+    engine.on_turn_complete([first])
+    engine.log.close()
+    restarted = _identity_engine(tmp_path)
+    if durable:
+        restarted.on_turn_complete([first, second])
+        assert [r.text for r in restarted.log.range(0, 1)] == ["continue", "continue"]
+        restarted.on_turn_complete([first, second])
+        assert restarted.log.count() == 2
+    else:
+        with pytest.warns(RuntimeWarning, match="ambiguous provisional"):
+            restarted.on_turn_complete([first, second])
+        assert restarted.log.count() == 1
+        state = json.loads((tmp_path / "ingest.json").read_text())
+        assert "ambiguous provisional" in state["failure"]["reason"]
+        restarted.log.close()
+        restarted = _identity_engine(tmp_path)
+        # Even a subsequently unique match cannot clear the unresolved interval.
+        with pytest.warns(RuntimeWarning, match="ambiguous provisional"):
+            restarted.on_turn_complete([first, {"role": "assistant", "content": "later"}])
+        assert restarted.log.count() == 1
+        assert json.loads((tmp_path / "ingest.json").read_text()) == state
+    restarted.log.close()
+
+
+def test_equal_payload_replacement_with_different_uid_is_not_a_boundary(tmp_path):
+    first = {"role": "user", "content": "continue", "message_uid": "first"}
+    engine = _identity_engine(tmp_path)
+    engine.on_turn_complete([first])
+    engine.log.close()
+    restarted = _identity_engine(tmp_path)
+    with pytest.warns(RuntimeWarning, match="cannot find its ingestion boundary"):
+        restarted.on_turn_complete([dict(first, message_uid="replacement")])
+    assert restarted.log.count() == 1
+    assert json.loads((tmp_path / "ingest.json").read_text())["lost"] is not None
+    restarted.log.close()
+
+
+@pytest.mark.parametrize("written", [0, 1, 3])
+@pytest.mark.parametrize("identity", ["uid", "upgrade", "ambiguous"])
+def test_interrupted_row_identity_across_restart(tmp_path, monkeypatch, written, identity):
+    row = _three_call_row()
+    if identity == "uid":
+        row["message_uid"] = "calls"
+    engine = _identity_engine(tmp_path)
+    original_save = engine._save_checkpoint
+    original_append = engine.log.append
+
+    def append(kind, text):
+        if engine.log.count() == written:
+            raise RuntimeError("identity crash")
+        return original_append(kind, text)
+
+    def save(rows, recent, **kwargs):
+        if rows == 1:
+            raise RuntimeError("identity crash")
+        original_save(rows, recent, **kwargs)
+
+    monkeypatch.setattr(engine.log, "append", append)
+    monkeypatch.setattr(engine, "_save_checkpoint", save)
+    with pytest.raises(RuntimeError, match="identity crash"):
+        engine.on_turn_complete([row])
+    before = json.loads((tmp_path / "ingest.json").read_text())
+    assert before["inflight"]["identity"]["kind"] == (
+        "uid" if identity == "uid" else "provisional")
+    engine.log.close()
+    row["message_uid"] = "calls"
+    rows = [row]
+    if identity == "ambiguous":
+        rows.append(dict(row, message_uid="other-calls"))
+    restarted = _identity_engine(tmp_path)
+    if identity == "ambiguous":
+        with pytest.warns(RuntimeWarning, match="ambiguous provisional"):
+            restarted.on_turn_complete(rows)
+        after = json.loads((tmp_path / "ingest.json").read_text())
+        assert after["inflight"] == before["inflight"]
+        assert restarted.log.count() == written
+    else:
+        restarted.on_turn_complete(rows)
+        after = json.loads((tmp_path / "ingest.json").read_text())
+        assert after["inflight"] is None
+        assert after["identities"] == [{"kind": "uid", "value": "calls"}]
+        assert restarted.log.count() == 3
+    restarted.log.close()
+
+
+def test_uid_notification_locates_occurrence_without_content_equality(tmp_path):
+    engine = _identity_engine(tmp_path)
+    rows = [{"role": "assistant", "content": "same", "message_uid": "first"},
+            {"role": "assistant", "content": "same", "message_uid": "second"}]
+    engine.on_message(rows, dict(rows[0], content="different clone payload"))
+    assert engine.log.count() == 1
+    assert json.loads((tmp_path / "ingest.json").read_text())["identities"] == [
+        {"kind": "uid", "value": "first"}]
+    engine.on_turn_complete(rows)
+    assert engine.log.count() == 2
+    engine.log.close()
+
+
+def test_provisional_notification_ambiguity_refuses_before_append(tmp_path):
+    engine = _identity_engine(tmp_path)
+    row = {"role": "assistant", "content": "same"}
+    with pytest.warns(RuntimeWarning, match="ambiguous provisional"):
+        engine.on_message([row, dict(row)], copy.deepcopy(row))
+    assert engine.log.count() == 0
+    assert (tmp_path / "ingest-unavailable.json").exists()
+    engine.log.close()
+
+
+def test_uid_boundary_never_calls_payload_fingerprint(tmp_path, monkeypatch):
+    engine = _identity_engine(tmp_path)
+    row = {"role": "user", "content": "old", "message_uid": "first"}
+    engine.on_turn_complete([row])
+    engine.log.close()
+    restarted = _identity_engine(tmp_path)
+
+    def forbidden(*args):
+        pytest.fail("UID boundary matching must not fingerprint payloads")
+
+    monkeypatch.setattr("optchat.engine._row_fingerprint", forbidden)
+    restarted.on_turn_complete([dict(row, content="revised")])
+    assert restarted.log.count() == 1
+    restarted.log.close()
+
+
+def test_legacy_checkpoint_reconciles_only_as_provisional(tmp_path):
+    engine = _identity_engine(tmp_path)
+    row = {"role": "user", "content": "legacy"}
+    engine.on_turn_complete([row])
+    path = tmp_path / "ingest.json"
+    state = json.loads(path.read_text())
+    state.pop("identity_version")
+    state.pop("identities")
+    state["fingerprints"] = [_row_fingerprint(row)]
+    path.write_text(json.dumps(state))
+    engine.log.close()
+    restarted = _identity_engine(tmp_path)
+    restarted.on_turn_complete([dict(row, message_uid="persisted")])
+    assert restarted.log.count() == 1
+    assert json.loads(path.read_text())["identities"] == [{"kind": "uid", "value": "persisted"}]
+    restarted.log.close()
+
+
+def test_duplicate_uid_candidates_refuse(tmp_path):
+    engine = _identity_engine(tmp_path)
+    row = {"role": "user", "content": "old", "message_uid": "duplicate"}
+    engine.on_turn_complete([row])
+    with pytest.warns(RuntimeWarning, match="ambiguous uid"):
+        engine.on_turn_complete([row, dict(row, content="different")])
+    assert engine.log.count() == 1
+    assert "ambiguous uid" in json.loads((tmp_path / "ingest.json").read_text())["failure"]["reason"]
+    engine.log.close()
+
+
+@pytest.mark.parametrize("change", ["reorder", "insert", "remove"])
+def test_retained_occurrence_order_cannot_be_crossed(tmp_path, change):
+    engine = _identity_engine(tmp_path)
+    rows = [{"role": "user", "content": "one", "message_uid": "one"},
+            {"role": "assistant", "content": "two", "message_uid": "two"}]
+    engine.on_turn_complete(rows)
+    if change == "reorder":
+        changed = list(reversed(rows))
+    elif change == "insert":
+        changed = [rows[0], {"role": "user", "content": "gap", "message_uid": "gap"}, rows[1]]
+    else:
+        changed = rows[1:]
+    with pytest.warns(RuntimeWarning, match="cannot find its ingestion boundary"):
+        engine.on_turn_complete(changed)
+    assert engine.log.count() == 2
+    state = json.loads((tmp_path / "ingest.json").read_text())
+    engine.on_turn_complete(rows + [{"role": "user", "content": "later", "message_uid": "later"}])
+    assert json.loads((tmp_path / "ingest.json").read_text()) == state
+    engine.log.close()
+
+
+def test_uid_identity_does_not_bypass_inflight_payload_validation(tmp_path, monkeypatch):
+    engine = _identity_engine(tmp_path)
+    row = {"role": "user", "content": "before", "message_uid": "same-occurrence"}
+    before = _interrupt_before_first_append(engine, [row], monkeypatch)
+    with pytest.warns(RuntimeWarning, match="no longer recomputes"):
+        engine.on_turn_complete([dict(row, content="after")])
+    assert engine.log.count() == 0
+    assert json.loads((tmp_path / "ingest.json").read_text())["inflight"] == before["inflight"]
+    engine.log.close()
+
+
+def test_provisional_marker_upgrade_is_durable_before_remainder_append(tmp_path, monkeypatch):
+    engine = _identity_engine(tmp_path)
+    row = {"role": "user", "content": "before"}
+    _interrupt_before_first_append(engine, [row], monkeypatch)
+    upgraded = _interrupt_before_first_append(engine, [dict(row, message_uid="assigned")], monkeypatch)
+    assert upgraded["inflight"]["identity"] == {"kind": "uid", "value": "assigned"}
+    assert "message_uid" not in row
+    engine.log.close()
+    restarted = _identity_engine(tmp_path)
+    restarted.on_turn_complete([dict(row, message_uid="assigned")])
+    assert restarted.log.count() == 1
+    restarted.log.close()
+
+
+@pytest.mark.parametrize("bad", [None, {"kind": "uid", "value": ""},
+                                 {"kind": "content", "value": "hash"}])
+def test_malformed_identity_never_falls_back_to_content(tmp_path, bad):
+    engine = _identity_engine(tmp_path)
+    row = {"role": "user", "content": "one", "message_uid": "one"}
+    engine.on_turn_complete([row])
+    path = tmp_path / "ingest.json"
+    state = json.loads(path.read_text())
+    state["identities"] = [bad]
+    state["fingerprints"] = [_row_fingerprint(row)]
+    path.write_text(json.dumps(state))
+    before = path.read_bytes()
+    with pytest.warns(RuntimeWarning, match="malformed checkpoint"):
+        engine.on_turn_complete([row])
+    assert engine.log.count() == 1 and path.read_bytes() == before
+    assert (tmp_path / "ingest-unavailable.json").exists()
+    engine.log.close()

@@ -116,7 +116,7 @@ def default_root() -> Path:
 
 # How many recent host rows the ingestion checkpoint remembers. More than one,
 # because the host may rewrite the head of a transcript (compression) while the
-# recent rows stay byte-identical - the boundary is then still findable.
+# recent occurrences retain their identities and order.
 CHECKPOINT_ROWS = 8
 
 
@@ -125,6 +125,37 @@ def _row_fingerprint(message: dict[str, Any]) -> str:
     stable = {key: message.get(key) for key in ("role", "content", "tool_calls", "tool_call_id")}
     payload = json.dumps(stable, sort_keys=True, ensure_ascii=False, default=str)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def _row_identity(message: dict[str, Any]) -> dict[str, str]:
+    """Use a host UID when available; never stamp identity onto a host row."""
+    uid = message.get("message_uid")
+    if isinstance(uid, str) and uid:
+        return {"kind": "uid", "value": uid}
+    return {"kind": "provisional", "value": _row_fingerprint(message)}
+
+
+def _valid_identity(value: Any) -> bool:
+    return (isinstance(value, dict) and value.get("kind") in ("uid", "provisional")
+            and isinstance(value.get("value"), str) and bool(value["value"]))
+
+
+def _identity_candidate(identity: dict[str, str], messages: list[dict[str, Any]]) -> int | None:
+    """Search the whole supplied projection, including rows beyond the old index.
+
+    Position alone cannot disambiguate equal provisional payloads. A UID never
+    falls back to content, and duplicate UIDs are unavailable evidence too.
+    """
+    if identity["kind"] == "uid":
+        candidates = [i for i, row in enumerate(messages)
+                      if row.get("message_uid") == identity["value"]]
+    else:
+        candidates = [i for i, row in enumerate(messages)
+                      if _row_fingerprint(row) == identity["value"]]
+    if len(candidates) > 1:
+        raise _RecoveryFailure(
+            f"recovery unavailable: identity has ambiguous {identity['kind']} candidates")
+    return candidates[0] if candidates else None
 
 
 def _record_digest(kind: str, text: str) -> str:
@@ -142,13 +173,17 @@ class _RecoveryFailure(RuntimeError):
 
 def _load_inflight(raw: Any) -> dict[str, Any] | None:
     """The durable in-flight marker, or ``None`` when absent or malformed."""
-    if not (isinstance(raw, dict) and isinstance(raw.get("fingerprint"), str)
+    if not isinstance(raw, dict):
+        return None
+    identity = raw.get("identity") if "identity" in raw else {
+        "kind": "provisional", "value": raw.get("fingerprint")}
+    if not (_valid_identity(identity)
             and type(raw.get("count_before")) is int and raw["count_before"] >= 0
             and isinstance(raw.get("records"), list)
             and all(isinstance(item, dict) and isinstance(item.get("kind"), str)
                     and isinstance(item.get("digest"), str) for item in raw["records"])):
         return None
-    return {"fingerprint": raw["fingerprint"], "count_before": raw["count_before"],
+    return {"identity": dict(identity), "count_before": raw["count_before"],
             "records": [{"kind": item["kind"], "digest": item["digest"]}
                         for item in raw["records"]]}
 
@@ -458,14 +493,21 @@ class OptChatEngine(ContextEngine):
             return {"unavailable": "recovery unavailable: malformed checkpoint envelope"}
         if raw.get("session") != self._session_id:
             return {"unavailable": "recovery unavailable: session transition on an existing stream"}
-        rows, fingerprints = raw.get("rows"), raw.get("fingerprints")
-        if (type(rows) is not int or rows < 0 or not isinstance(fingerprints, list)
-                or not all(isinstance(item, str) for item in fingerprints)):
+        rows = raw.get("rows")
+        identities = raw.get("identities")
+        if "identities" not in raw and "identity_version" not in raw:
+            legacy = raw.get("fingerprints")
+            identities = ([{"kind": "provisional", "value": item} for item in legacy]
+                          if isinstance(legacy, list) else None)
+        if (raw.get("identity_version", 2) != 2
+                or type(rows) is not int or rows < 0 or not isinstance(identities, list)
+                or not all(_valid_identity(item) for item in identities)
+                or len(identities) != min(rows, CHECKPOINT_ROWS)):
             return {"unavailable": "recovery unavailable: malformed checkpoint envelope"}
         inflight = _load_inflight(raw.get("inflight"))
         committed = raw.get("committed_count")
         self._committed_count = committed
-        return {"rows": rows, "fingerprints": fingerprints,
+        return {"rows": rows, "identities": identities,
                 "committed_count": committed,
                 "inflight": inflight,
                 "inflight_malformed": raw.get("inflight") is not None and inflight is None,
@@ -499,7 +541,7 @@ class OptChatEngine(ContextEngine):
 
         ``(start, skip)``: ingestion resumes at row ``start``, and that row's
         first ``skip`` records are already in the log. The boundary is found by
-        row fingerprint in the legacy path. No match leaves a durable unresolved
+        durable UID, or a uniquely matched provisional payload. No match leaves a durable unresolved
         interval; it cannot be crossed by later turns.
 
         The durable in-flight marker is validated before anything is skipped:
@@ -516,6 +558,10 @@ class OptChatEngine(ContextEngine):
             raise _RecoveryFailure(checkpoint["unavailable"])
         if checkpoint.get("lost") is not None:
             return None
+        failure = checkpoint.get("failure")
+        if (isinstance(failure, dict) and isinstance(failure.get("reason"), str)
+                and failure["reason"].startswith("recovery unavailable: identity")):
+            raise _RecoveryFailure(failure["reason"])
         log = self.log
         assert log is not None  # _resume_row is called through _open()
         if checkpoint.get("inflight_malformed"):
@@ -527,21 +573,28 @@ class OptChatEngine(ContextEngine):
             raise _RecoveryFailure("recovery unavailable: committed record frontier is missing")
         if isinstance(marker, dict) and marker["count_before"] != committed:
             raise _RecoveryFailure("in-flight count_before disagrees with the committed record frontier")
-        known = set(checkpoint["fingerprints"])
-        start = None
-        if known:
-            for row in range(min(len(messages), checkpoint["rows"]) - 1, -1, -1):
-                if _row_fingerprint(messages[row]) in known:
-                    start = row + 1
-                    break
-        elif checkpoint["rows"] <= len(messages):
-            start = checkpoint["rows"]
-        if start is None:
+        # Retain the ordered recent suffix, rather than treating old identities
+        # as interchangeable anchors. Missing/reordered entries cannot authorize
+        # advancing from an earlier match across the missing final occurrence.
+        positions = [_identity_candidate(identity, messages)
+                     for identity in checkpoint["identities"]]
+        if any(position is None for position in positions):
             return None
-        if isinstance(marker, dict) and (
-                start >= len(messages)
-                or _row_fingerprint(messages[start]) != marker["fingerprint"]):
+        if any(right != left + 1 for left, right in zip(positions, positions[1:])):
             return None
+        start = positions[-1] + 1 if positions else 0
+        if isinstance(marker, dict):
+            candidate = _identity_candidate(marker["identity"], messages)
+            if candidate != start:
+                return None
+        # A provisional association is conditional on this unique, ordered
+        # projection. Persist upgrades even when the reconciler has no new rows.
+        recent = [_row_identity(messages[position]) for position in positions]
+        if recent != checkpoint["identities"] or start != checkpoint["rows"]:
+            checkpoint["identities"] = recent
+            checkpoint["rows"] = start
+            self._save_checkpoint(start, recent, inflight=marker,
+                                  lost=checkpoint.get("lost"), failure=checkpoint.get("failure"))
         return start, delta
 
     def _record_lost_boundary(self, messages: list[dict[str, Any]],
@@ -556,7 +609,7 @@ class OptChatEngine(ContextEngine):
                 RuntimeWarning, stacklevel=2)
         if checkpoint is not None and checkpoint.get("lost") is None:
             self._save_checkpoint(
-                checkpoint["rows"], checkpoint["fingerprints"],
+                checkpoint["rows"], checkpoint["identities"],
                 inflight=checkpoint.get("inflight_raw", checkpoint.get("inflight")),
                 lost={"rows": checkpoint["rows"],
                       "committed_count": checkpoint.get("committed_count"),
@@ -604,18 +657,18 @@ class OptChatEngine(ContextEngine):
                     # Keep the unreadable marker as it was: dropping it would let a
                     # later call treat the partial row as complete and duplicate it.
                     inflight = checkpoint.get("inflight_raw")
-                self._save_checkpoint(checkpoint["rows"], checkpoint["fingerprints"],
+                self._save_checkpoint(checkpoint["rows"], checkpoint["identities"],
                                       inflight=inflight,
                                       lost=checkpoint.get("lost"),
                                       failure={"reason": reason})
 
-    def _save_checkpoint(self, rows: int, recent: list[str], *,
+    def _save_checkpoint(self, rows: int, recent: list[dict[str, str]], *,
                          inflight: dict[str, Any] | None = None,
                          lost: dict[str, Any] | None = None,
                          failure: dict[str, Any] | None = None) -> None:
         atomic_json(self._checkpoint_path(),
                     {"session": self._session_id, "rows": rows,
-                     "fingerprints": recent[-CHECKPOINT_ROWS:],
+                     "identity_version": 2, "identities": recent[-CHECKPOINT_ROWS:],
                      "committed_count": self._committed_count,
                      "inflight": inflight, "lost": lost, "failure": failure})
 
@@ -1107,7 +1160,7 @@ class OptChatEngine(ContextEngine):
         log, tree, view, compactor = self._open()
         chat_root = self._chat_root or self.root
         assert chat_root is not None
-        recent = list(checkpoint["fingerprints"]) if checkpoint else []
+        recent = list(checkpoint["identities"]) if checkpoint else []
         lost = checkpoint.get("lost") if checkpoint else None
         marker = checkpoint.get("inflight") if checkpoint else None
         child_index = self._child_index() if self._chat_root == self.root else {}
@@ -1146,12 +1199,15 @@ class OptChatEngine(ContextEngine):
             else:
                 records = [(kind, text, None, None) for kind, text in
                            self._records(message, self.node_bytes, tool_name)]
-            fingerprint = _row_fingerprint(message)
+            identity = _row_identity(message)
             expected = [{"kind": kind, "digest": _record_digest(kind, text)}
                         for kind, text, _label, _key in records]
             resumed = row == start and marker is not None
             if resumed:
                 self._validate_resumed_row(records, marker)
+                if marker["identity"] != identity:
+                    marker = dict(marker, identity=identity)
+                    self._save_checkpoint(row, recent, inflight=marker)
                 # The media archive hangs off the row's first record, which is
                 # already in the log: re-running it is idempotent and repairs a
                 # crash between the first append and the archive.
@@ -1159,7 +1215,7 @@ class OptChatEngine(ContextEngine):
                     archive_media(chat_root, log.count() - skip, message.get("content"))
                 records = records[skip:]
             if expected and not resumed:
-                marker = {"fingerprint": fingerprint, "count_before": log.count(),
+                marker = {"identity": identity, "count_before": log.count(),
                           "records": expected}
                 # Publish the independent committed frontier before the intent.
                 self._committed_count = log.count()
@@ -1176,7 +1232,7 @@ class OptChatEngine(ContextEngine):
             # before publishing the new committed frontier.
             if marker is not None:
                 self._validate_range(marker, complete=True)
-            recent.append(fingerprint)
+            recent.append(identity)
             self._committed_count = log.count()
             self._save_checkpoint(row + 1, recent, inflight=None, lost=None)
             marker = None
@@ -1198,9 +1254,9 @@ class OptChatEngine(ContextEngine):
         log is written during the turn instead of only at its boundary. Ingestion
         starts at the checkpoint boundary, so rows the host appended without a
         notification (the turn's user row, synthetic nudges) are ingested too;
-        the appended row itself is located by equality against the structural
-        clone the host hands over, never assumed to be the last row. A boundary
-        that cannot be found is recorded once and retried by a later call; an
+        the appended row itself is located by UID, or a unique provisional match
+        against the clone, never assumed to be the last row. A boundary
+        that cannot be found is recorded as an unresolved interval; an
         unvalidatable in-flight range is a loud, durable recovery failure.
         Fail-open: anything unexpected leaves the turn untouched, and
         ``on_turn_complete`` reconciles at the boundary.
@@ -1213,6 +1269,7 @@ class OptChatEngine(ContextEngine):
         checkpoint = self._load_checkpoint()
         try:
             resolved = self._resume_row(messages, checkpoint)
+            row = _identity_candidate(_row_identity(message), messages)
         except _RecoveryFailure as failure:
             self._record_recovery_failure(failure, checkpoint)
             return
@@ -1222,8 +1279,6 @@ class OptChatEngine(ContextEngine):
             self._record_lost_boundary(messages, checkpoint)
             return
         start, skip = resolved
-        row = next((index for index in range(len(messages) - 1, -1, -1)
-                    if messages[index] == message), None)
         if row is None or start >= row + 1:
             # Not found, or already ingested (a duplicate notification).
             return

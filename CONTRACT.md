@@ -904,3 +904,104 @@ ordered-frontier requirements. Removing that fallback requires changing existing
 UID-less restart and changed-tail tests beyond the single lost-boundary test
 allowed by this task. That scope decision is pending; this amendment records the
 engine-side hardening without claiming full D4 compliance or P2a readiness.
+
+---
+
+# Revision 17 - identity-first recovery (2026-10-12)
+
+Order 2c supersedes revision 16's **Remaining requirement / test conflict**
+paragraph and revision 14's fingerprint checkpoint example. Revision 16's range
+validation, append exclusion, durable publication and unresolved-state rules
+remain in force. This resolves the engine's content-as-identity fallback; it does
+not claim full D4 compliance or safe P2a completion.
+
+## Recorded identities and source matching
+
+New checkpoints use `identity_version: 2`, an ordered `identities` suffix of at
+most eight committed host rows, and `inflight.identity` for an interrupted row:
+
+```json
+{"session": "...", "identity_version": 2, "rows": 1,
+ "identities": [{"kind": "uid", "value": "host-message-uid"}],
+ "committed_count": 1,
+ "inflight": {"identity": {"kind": "provisional", "value": "payload-hash"},
+              "count_before": 1, "records": [{"kind": "...", "digest": "..."}]},
+ "lost": null, "failure": null}
+```
+
+- A nonempty string `message_uid` is recorded as `kind: uid`. Source-boundary
+  matching and notification targeting use that UID only, without comparing
+  content or falling back to a payload hash. Distinct UIDs with identical payloads
+  remain distinct occurrences. A committed occurrence with the same UID is not
+  reingested merely because the host revised its payload. For an interrupted
+  occurrence, the full recomputed record sequence must still validate, including
+  delta zero; UID equality cannot authorize a changed transaction payload.
+- A row without a valid UID is explicitly `kind: provisional`, using the existing
+  payload fingerprint. The engine never assigns a UID to the host's row. Legacy
+  `fingerprints` and `inflight.fingerprint` are read only as provisional evidence;
+  they are never promoted to durable identity just by loading them. Malformed
+  labeled identity data cannot fall back to a legacy fingerprint.
+- Each candidate search covers the entire supplied source projection, including
+  positions beyond the old row count. Exactly one candidate is required, for both
+  UID and provisional matching. Multiple provisional candidates, including
+  equal-content rows carrying different eventual UIDs, explicitly refuse.
+  Duplicate UIDs refuse too. No position, newest match, or payload preference
+  resolves a tie. Notification targeting follows the same rule.
+- All retained committed identities must occur contiguously in their recorded
+  order. The interrupted identity, if present, must immediately follow them.
+  An older retained match cannot substitute for a missing final boundary. Missing,
+  inserted, reordered, or removed occurrences within that retained suffix leave
+  `lost` unresolved; even removal of an otherwise harmless older retained row is
+  conservatively unavailable. A rewritten prefix before the retained suffix can
+  still match. This bounded suffix check is not a durable source-order proof.
+- A uniquely matched provisional row that now carries a UID is upgraded during
+  reconciliation. Committed upgrades are atomically saved even on an otherwise
+  empty walk or duplicate notification. An interrupted row's upgrade is published
+  only after its recomputed sequence validates, and before any remaining append.
+  A later restart can therefore use the UID. Raw records are never rewritten.
+- An identity ambiguity is recorded in `failure` with a `recovery unavailable:
+  identity` reason. That failure is sticky across hooks and restarts: a later
+  unique candidate cannot clear it or cross the interval. The checkpoint and
+  marker remain available for inspection; a fresh stream without a checkpoint
+  uses the existing unavailable sidecar. Existing `lost` and sidecar states also
+  remain sticky. No automatic reset or operator repair API is added.
+
+## Host evidence and explicit limits
+
+`tests/test_host_identity.py` checks the sibling `opthermes-seam` checkout using
+real `SessionDB` insertion/restoration, post-commit synchronization, and the
+actual hook and structural-clone function bodies. The loop bodies are extracted
+to avoid application startup; cache-policy setup is stubbed. The tests skip
+explicitly when that checkout is absent. These are version-specific local
+conformance probes, not full live-agent lifecycle tests.
+
+- Insert mints distinct UIDs, post-commit synchronization copies them onto live
+  rows, and restoration preserves them without requiring physical row IDs.
+- `on_message` preserves stamped fields in its source rows and notified clone;
+  fresh live appends before persistence have no UID.
+- `on_turn_complete` preserves UIDs in its structural clones of persisted rows.
+- `select_context` preserves them in `conversation_messages` and
+  `incoming_message`, but its API request rows are stripped of persistence fields.
+- `cache_plan` receives API rows without UIDs. It is not an ingestion source.
+
+The association of a unique provisional payload with an eventual UID is
+conditional on the supplied projection still representing the same occurrence.
+An unseen replacement with identical payload cannot be detected from these
+arguments. Durable **pre-observation identity**, replayable notifications and
+ordered source frontiers remain required host work; the engine does not invent
+those guarantees. Uniqueness within a supplied window does not prove global
+occurrence uniqueness, completeness before the retained suffix, stream ownership,
+or continuity through host compression, absorbed occurrences or UID-preserving
+content revisions. Ambiguity visible in the supplied projection refuses.
+
+The host-integrated P2a matrix, live provider retries/failover/steering, child-stream
+provenance, and physical power-loss behavior remain unverified. Expected record
+digests remain payload validation, not independent occurrence ownership. Content
+keys in delegate-result caches and request-tail equality matching are outside
+this change and retain their existing limitations.
+
+The fresh-stream silent guard and legitimate delta-zero retry guard remain
+unchanged. UID-less restart examples now distinguish durable-UID resume, unique
+provisional reconciliation, and explicit ambiguity refusal. The changed-tail
+example refuses a missing committed boundary instead of selecting an earlier
+content match. Neither logging nor persisted-view recovery is rebuilt.
