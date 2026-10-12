@@ -118,3 +118,49 @@ not "actually served" - selection precedes sanitization, cache decoration and se
 **D1**: describe capabilities and failure behaviour **per route**, not by branch name. The seam host
 still sends the original transcript after two refusals and fails open on ordinary selection
 exceptions, which can violate the view-only continuity law.
+
+
+---
+
+# Revision 3 - after the second challenge: D2 and D4 (2026-10-12)
+
+The second pass (`~/.hermes/cache/scratch/codex-D2D4-last.md`) reviewed revision 2 and the landed
+Order 2 implementation. Verdict: revision 2 is not sufficient to approve P2a as written, and D4's
+requirements stand while the implementation does not yet meet them.
+
+**D2 is upgraded from "pursue" to a requirement.** P2a's safety rests on logical-turn ownership: the
+engine must receive a host-supplied boundary tied to the originally admitted occurrence - never an
+index derived from the text-based reanchor, and never a claim that the host's anchor is proven
+correct. The boundary contract (the challenge's minimal shape: `session_id`, `turn_id`,
+`reading_scope_id`, `incoming_uid`, `request_start`; delivered as a `turn_boundary` keyword to
+`select_context`) must guarantee: `incoming_uid` identifies the admitted logical-turn occurrence;
+`request_start` addresses exactly the supplied request at selection entry; the suffix contains all
+current-turn contributions in order and no prior-turn payload; a row spanning logical turns is
+projected separately by the host or reported unavailable; retry, failover and steering retain
+logical-turn identity; boundary unavailability has explicit behaviour. A lone integer cannot
+describe a merged row - the host reports unavailable rather than fabricating an index. The engine
+consumes the boundary when supplied, keeps version-specific conformance checks of the
+occurrence-to-request mapping (ordered provenance and exact host-transformed payloads - never
+lengths, unordered hashes, or normalized text), never reconstructs the outgoing tail from raw rows,
+and where the boundary is absent its guarantees are limited to what the host supplied - stated, not
+silently filled in with the reanchor's result. Durable pre-observation occurrence identity (an
+occurrence id assigned before observation, preserved through persistence, carried by notifications)
+is a required host change; until it exists, identity across a crash is ambiguous and must be an
+explicit limit - content matching never stands in for occurrence identity.
+
+**D4 keeps revision 2's requirements; the landed protocol does not yet meet them.** From the
+verdicts: content fingerprints still stand in for occurrence identity; a marker's expected sequence
+asserts ownership it does not prove ("ordinal provenance" overstates what is recorded); the
+zero-delta path skips validation; a wrong `count_before` is undetected; the newest-anchor
+lost-boundary advance contradicts revision 2 and is replaced by preserving the unresolved interval
+(report unavailable; never advance across it); an unreadable or session-mismatched checkpoint on an
+established stream must not silently become a fresh ingestion; notes appends can interleave inside a
+transaction; a completed range is cleared without validation; a new day file is fsynced without its
+directory. The engine-side hardening lands these fixes and amends CONTRACT revision 14's
+"ordinal provenance" and newest-anchor claims. Text that only records what was expected must not
+claim ownership; say what is proven, and mark the rest unverified.
+
+**Readiness.** Design and conformance work for P2a proceeds now; a claim of safe P2a completion waits
+on the host boundary seam and the recovery prerequisites above. Execution of the challenge's full
+host-integrated test matrix remains unverified until then, and the documents say so.
+
