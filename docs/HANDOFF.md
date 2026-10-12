@@ -20,18 +20,18 @@ Where it stands:
   and on_message. They are NOT merged into any running host, and there are NO PRs - the user's rule
   is that nothing goes upstream until he has tested it on his terms.
 - Orders 1, 2 and 4 of the plan are **DONE and merged to main** (Order 1: 07d5fa8 → f548c0d;
-  Order 2: 6dcfa92; Order 4: 0fa9f67 plus the host gate 81af99c011 in the seam worktree). Their
-  worktrees are removed and nothing is in flight. Main is at HEAD with 240 tests green, CONTRACT
-  revisions 12-14 in order.
-- **P3b must be redone** (see D5's reversal below): Order 1's implementation reconstructs the view
-  from the tree's saved nodes, which is forbidden reconstruction. Redo it as exact-state recovery or
-  an explicit unavailable-state outcome, and amend CONTRACT revision 12's clause.
+  Order 2: 6dcfa92; Order 4: 0fa9f67 plus the host gate 81af99c011 in the seam worktree). Worktrees
+  removed, nothing in flight. Main is at HEAD with 245 tests green, CONTRACT revisions 12-15 in order.
+- **P3b has been redone** (commit 8fa8cb9, CONTRACT revision 15): the rebuild is cut, and a missing view
+  state is an explicit unavailable outcome - ViewStateUnavailable, nothing written, the engine steps
+  aside for the session. Exact-state recovery of a missing view.json is impossible from the surviving
+  artifacts; revision 15 records that as a decision, not an omission.
 - **Order 0's decisions are written and then challenged** - `docs/DECISIONS.md`, revision 2. Read it
   before touching orders 2/3/5, because the challenge reversed one of them:
   - **D5 reversed**: Order 1's P3b reconstructs the view from the tree's saved nodes, which IS
-    reconstruction and is forbidden by AGENTS.md and plan revision 2. **P3b must be redone** as
-    exact-state recovery or an explicit unavailable-state outcome, and CONTRACT revision 12's clause
-    amended.
+    reconstruction and is forbidden by AGENTS.md and plan revision 2. **P3b is redone** as the
+    explicit unavailable-state outcome (commit 8fa8cb9); CONTRACT revision 12's clause is superseded by
+    revision 15.
   - D2 needs a host-owned occurrence identity or a durable correlation mechanism; the suffix
     invariant is supported by this assembly but not guaranteed by the interface.
   - D4's count delta is unsound alone (refused positions count; `notes.py` can interleave) - it must
@@ -44,13 +44,13 @@ FIRST, check that state:
 
 What is next, in the plan's order:
 
-- Order 0's decisions (D1-D5 in the plan). Hold their challenge pass for Codex's reset; the two that
-  genuinely need it are D2 (the host's current-turn suffix invariant) and D4 (the recovery protocol).
-- Orders 2-5: the durability protocol (P1b/P1d); the turn boundary and the frozen view (P2a/P3a);
-  truthful retrieval (P6b, the navigation gate #16, and a real transcript-swap acceptance test); then
-  the compaction's request identity (P4a) and the cache measurements (P4b).
+- The D2/D4 challenge pass on the written decisions (D2: the host's current-turn suffix invariant;
+  D4: the recovery protocol) - held for Codex's reset, as before.
+- Order 3 (P2a, P3a): the turn boundary by UID, and the frozen served view. P2a leans on D2, so its
+  implementation absorbs that challenge pass.
+- Order 5 (P4a, P4b): the compaction's request identity, then the cache measurements.
 - Then a LIVE RUN. The engine has not been exercised inside a real host since WP4, and that run is
-  also the gate for merging the host seams.
+  also the gate for merging the host seams (seam worktree: `feat/context-engine-seams` at 81af99c011).
 
 Rules the user holds me to:
 

@@ -79,6 +79,10 @@ both forbid, and it does not recover the previous pair selection, batch state, o
 **P3b must be redone**: exact-state recovery, or an explicit unavailable-state outcome - never
 automatic reconstruction - and CONTRACT revision 12's clause must be amended.
 
+**Landed:** P3b redone as the explicit unavailable-state outcome - exact recovery is impossible from
+the surviving artifacts, so the engine never rebuilds, writes nothing, and steps aside for the
+session (commit 8fa8cb9; CONTRACT revision 15).
+
 **D2 needs a host-owned identity or a correlation mechanism.** End-of-turn reconciliation alone
 reopens duplication: ingest a UID-less row provisionally, the host persists it under a UID, crash
 before reconciliation, restart presents the UID while the engine knows only the provisional one -

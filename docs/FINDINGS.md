@@ -29,11 +29,11 @@ The plan's orders (`docs/PLAN-next.md`, revision 2) run on top of these:
 
 | Order | items | subject | status |
 |---|---|---|---|
-| Order 1 | P1c, P6a, P1a, P3b | loud corruption with no id reuse, non-writing foreign readers, view recovery independent of roots, explicit missing-view state | DONE (07d5fa8, merged f548c0d) |
-| Order 4 | P6b, #16, acceptance test | truthful, usable retrieval | DONE (0fa9f67 engine, host gate in the seam worktree) |
-| Order 0 | D1-D5 | the decisions: target host, `message_uid` identity, the frozen view, the recovery protocol, missing-view policy | held for Codex's reset |
-| Order 2 | P1b, P1d | the durability protocol | held (needs D4) |
-| Order 3 | P2a, P3a | the turn boundary by UID, and the frozen served view | held (needs D2/D3) |
+| Order 1 | P1c, P6a, P1a, P3b | loud corruption with no id reuse, non-writing foreign readers, view recovery independent of roots, explicit missing-view state | DONE (07d5fa8, merged f548c0d; P3b redone per D5's reversal in 8fa8cb9, CONTRACT revision 15) |
+| Order 4 | P6b, #16, acceptance test | truthful, usable retrieval | DONE (0fa9f67 engine, host gate 81af99c011 in the seam worktree) |
+| Order 0 | D1-D5 | the decisions: target host, `message_uid` identity, the frozen view, the recovery protocol, missing-view policy | written (dc243aa) and challenged (revision 2, 34cccbe); the D2/D4 challenge pass is held for the Codex reset |
+| Order 2 | P1b, P1d | the durability protocol | DONE (6dcfa92, merged 4a7d925) |
+| Order 3 | P2a, P3a | the turn boundary by UID, and the frozen served view | held (needs D2/D3; P2a waits on the held D2 challenge pass) |
 | Order 5 | P4a, P4b | the compaction's request shape, then the measurements | held (needs D3) |
 
 Order and why: **WP1** first (the turn-boundary bug is the most urgent active-turn defect and
