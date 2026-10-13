@@ -239,3 +239,19 @@ clear the spent/dead-holder row (registry prune + targeted row delete). Fix dire
 must not keep turn fencing open once the response is delivered, or the wait must recognize its own
 session's draining turn. The delivery path itself stayed correct throughout: log, checkpoint and
 view all consistent; nothing dropped from the log except unprocessed sends (which never existed).
+
+Third interactive finding (the cascade, same ride): the checkpoint recorded a durable ``lost``
+frontier ({rows: 44, committed_count: 137, observed_rows: 21, reason: "recovery unavailable:
+ordered occurrence frontier absent"} - the engine was shown a 21-row history that did not contain
+its last eight committed row-identities). By design ``_resume_row`` refuses to advance across it,
+so ingestion froze at 137 records while the session grew to 116 messages. On the next turn the
+selection then hit "no saved render predates the admitted occurrence" (03:37:49; same family as
+02:32:41) and the engine stepped aside stickily for the process; the host fell back to the full
+transcript, whose requests grew in=63,101 -> in=94,215 (cache 96-99%) toward Hermes' compression
+threshold. Nothing was compressed; log, checkpoint and view never corrupted. Separately, the
+compaction summarizer's HTTP call has no timeout: a hung call parked a thread for the full 600s
+until the turn-liveness watchdog force-killed the turn (thread dump in agent.log). Diagnosis next:
+(1) which host call site handed the engine a history missing its committed frontier, or what
+churned the identity chain; (2) the ingestion-vs-selection ordering behind the capture refusals;
+(3) bound the summarizer call. The stream is preserved as evidence; re-ride on a fresh root after
+the fixes, as the test bed.
