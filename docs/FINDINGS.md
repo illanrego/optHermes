@@ -217,3 +217,14 @@ bound a host `TurnBoundary`; the selected view was frozen, served and retired ea
 still to measure on the wire; the engine-side harness shows a fresh request for the same target is
 byte-identical. Earlier: the recorded 16,000/16,363 measurement covered two calls inside one turn
 only.
+
+Interactive follow-up (same day, the user's own two real turns on `LOGGED-3`): turn 1 was fully
+engine-served, then a mid-session model switch (deepseek-v4-flash → deepseek-v4.1-flash) rebuilt
+the runtime identity and the engine stepped aside for the rest of the session — "Chat log is
+locked": a second `Log` instance (flock, exclusive, nonblocking) could not acquire the chat while
+the session's original instance held it. Every later hook failed loudly, the host answered with
+unmodified requests, nothing was corrupted, and the exit cleanup hit the same lock. Suspect: the
+model-switch runtime rebuild re-creates the engine without closing the live one. Follow-up: repro
+with consecutive interactive turns, find the rebuild path, reuse the instance (host-side fix).
+Session wire totals after the ride: turns 6 calls / 13,437 new / 9,216 cache-read; compactions 12
+calls / 32,847 input / **22,784 cache-read (69% cached)**.

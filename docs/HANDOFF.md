@@ -54,7 +54,9 @@ What is next, in the plan's order:
   zoom/date round-tripped; wire numbers: turn->turn 9216 cache-read tokens,
   turn->compaction 7936 across 8 compactions. What
   remains: your own session on your terms (the upstream gate), a compaction->compaction wire
-  number, and then the seam-merge/PR decision.
+  number, and then the seam-merge/PR decision. The user's first ride (two real turns) found an
+  interactive multi-turn lock race at the model-switch boundary (see FINDINGS: the engine steps
+  aside loudly; fix before the seams merge).
 - Live-run recipe: `~/Documents/coding/opthermes-seam/.hermes/bin/hermes -p opthermes-dev -t
   context_engine` (the checkout's own launcher; bare `hermes` runs the main build with no seams).
   Continue the ONE continuous session with `--resume <id> chat -q "..."`; a fresh `-q` session on a
