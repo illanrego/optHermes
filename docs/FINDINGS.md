@@ -224,7 +224,18 @@ the runtime identity and the engine stepped aside for the rest of the session â€
 locked": a second `Log` instance (flock, exclusive, nonblocking) could not acquire the chat while
 the session's original instance held it. Every later hook failed loudly, the host answered with
 unmodified requests, nothing was corrupted, and the exit cleanup hit the same lock. Suspect: the
-model-switch runtime rebuild re-creates the engine without closing the live one. Follow-up: repro
+Suspect: the model-switch runtime rebuild re-creates the engine without closing the live one. Follow-up: repro
 with consecutive interactive turns, find the rebuild path, reuse the instance (host-side fix).
 Session wire totals after the ride: turns 6 calls / 13,437 new / 9,216 cache-read; compactions 12
 calls / 32,847 input / **22,784 cache-read (69% cached)**.
+
+Second interactive finding (same ride, the note-merge wave): the engine's post-turn drain (batched
+`run_pending` model calls) keeps the turn thread alive and the turn lease held after the reply is
+delivered, so the user's next message waits on "another Hermes process" that is the session's own
+finishing turn (self-nesting; the holder pid is the same live window). Interrupting aborts the
+wait but leaves the thread/lease in place; re-sending re-arms the wait and the message is not
+processed. An exit during this window leaves the turn-lease row until its TTL. Operator mitigation:
+clear the spent/dead-holder row (registry prune + targeted row delete). Fix direction: the drain
+must not keep turn fencing open once the response is delivered, or the wait must recognize its own
+session's draining turn. The delivery path itself stayed correct throughout: log, checkpoint and
+view all consistent; nothing dropped from the log except unprocessed sends (which never existed).
